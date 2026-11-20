@@ -78,6 +78,7 @@ class PaymentReceipt(TimeStampedModel):
         PENDING = "pending", "Pending review"
         APPROVED = "approved", "Approved"
         REJECTED = "rejected", "Rejected"
+        CANCELLED = "cancelled", "Cancelled with the order"
 
     class ReservationStatus(models.TextChoices):
         RESERVED = "reserved", "All items reserved"

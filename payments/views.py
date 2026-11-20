@@ -5,7 +5,7 @@ from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
+from core.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from commerce.models import Order
@@ -98,7 +98,15 @@ class AdminReceiptViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, view
     permission_classes = [AdminModelPermission]
     filterset_fields = ["status", "reservation_status", "payment__order"]
     search_fields = ["payment__order__number", "reference_number", "uploaded_by__phone"]
-    action_perms = {"approve": ["payments.review_payment"], "reject": ["payments.review_payment"]}
+    action_perms = {"approve": ["payments.review_payment"], "reject": ["payments.review_payment"],
+                    "retry_reservation": ["payments.review_payment"]}
+
+    @extend_schema(request=None, responses=s.AdminReceiptSerializer)
+    @action(detail=True, methods=["post"], url_path="retry-reservation")
+    def retry_reservation(self, request, pk=None):
+        """Re-attempt the atomic reservation for a pending receipt (e.g. after resolving a conflict)."""
+        receipt = services.attempt_reservation(self.get_object())
+        return Response(self.get_serializer(self.get_queryset().get(pk=receipt.pk)).data)
 
     @extend_schema(request=s.ReviewActionSerializer, responses=s.AdminReceiptSerializer)
     @action(detail=True, methods=["post"])

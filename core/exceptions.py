@@ -7,6 +7,7 @@ Every error response has the shape::
 import logging
 
 from django.core.exceptions import PermissionDenied, ValidationError as DjangoValidationError
+from django.db.models import ProtectedError, RestrictedError
 from django.http import Http404
 from rest_framework import exceptions, status
 from rest_framework.response import Response
@@ -35,7 +36,20 @@ class ConflictError(ServiceError):
     default_code = "conflict"
 
 
+def protected_conflict(exc, hint="Archive or deactivate it instead."):
+    blockers = {}
+    for obj in list(getattr(exc, "protected_objects", None) or getattr(exc, "restricted_objects", None) or [])[:50]:
+        label = obj._meta.verbose_name_plural.title()
+        blockers[label] = blockers.get(label, 0) + 1
+    return ConflictError(
+        f"This object is referenced by other records and cannot be deleted. {hint}",
+        code="protected", details={"referenced_by": blockers},
+    )
+
+
 def api_exception_handler(exc, context):
+    if isinstance(exc, (ProtectedError, RestrictedError)):
+        exc = protected_conflict(exc)
     if isinstance(exc, DjangoValidationError):
         exc = exceptions.ValidationError(
             exc.message_dict if hasattr(exc, "error_dict") else {"non_field_errors": exc.messages}

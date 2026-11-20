@@ -46,6 +46,32 @@ def upload_receipt(order, user, uploaded, reference_number="", payer_card_last4=
     sha = PaymentReceipt.digest(uploaded)
 
     # Step 1: persist the receipt (committed independently of the reservation).
+    stored = {"name": None}
+    try:
+        receipt = _store_receipt(order, user, uploaded, stored, content_type, sha, reference_number,
+                                 payer_card_last4, paid_at, declared_amount, customer_note)
+    except BaseException:
+        # Transaction rolled back: never leave an unreferenced private file behind.
+        if stored["name"] and not PaymentReceipt.objects.filter(file=stored["name"]).exists():
+            PaymentReceipt.file.field.storage.delete(stored["name"])
+        raise
+
+    # Step 2: atomic all-or-nothing reservation attempt. Any failure here keeps
+    # the receipt; 'not_attempted' receipts are retried by the scheduled job.
+    try:
+        attempt_reservation(receipt)
+    except Exception:  # noqa: BLE001
+        logger.exception("Reservation attempt crashed for receipt %s; will be retried", receipt.pk)
+    receipt.refresh_from_db()
+
+    from notifications.services import notify_admins_receipt_uploaded
+
+    transaction.on_commit(lambda: notify_admins_receipt_uploaded(receipt))
+    return receipt
+
+
+def _store_receipt(order, user, uploaded, stored, content_type, sha, reference_number, payer_card_last4,
+                   paid_at, declared_amount, customer_note):
     with transaction.atomic():
         order = Order.objects.select_for_update().get(pk=order.pk)
         if order.user_id != user.pk:
@@ -72,32 +98,52 @@ def upload_receipt(order, user, uploaded, reference_number="", payer_card_last4=
             customer_note=customer_note[:1000],
         )
         receipt.file.save(uploaded.name, uploaded, save=False)
-        try:
-            receipt.save()
-        except Exception:
-            receipt.file.delete(save=False)
-            raise
+        stored["name"] = receipt.file.name
+        receipt.save()
         payment.status = Payment.Status.UNDER_REVIEW
         payment.save(update_fields=["status", "updated_at"])
         set_status(order, S.PAYMENT_SUBMITTED, user, "Receipt uploaded")
-
-    # Step 2: atomic all-or-nothing reservation attempt.
-    try:
-        reserve_for_order(order)
-        receipt.reservation_status = PaymentReceipt.ReservationStatus.RESERVED
-        receipt.reservation_detail = {}
-    except ReservationConflict as exc:
-        receipt.reservation_status = PaymentReceipt.ReservationStatus.CONFLICT
-        receipt.reservation_detail = exc.details
-        order.refresh_from_db()
-        order.flag_for_review("Inventory reservation failed after receipt upload.")
-        logger.warning("Reservation conflict for order %s: %s", order.number, exc.details)
-    receipt.save(update_fields=["reservation_status", "reservation_detail", "updated_at"])
-
-    from notifications.services import notify_admins_receipt_uploaded
-
-    transaction.on_commit(lambda: notify_admins_receipt_uploaded(receipt))
     return receipt
+
+
+def attempt_reservation(receipt):
+    """Idempotently (re)try reserving a pending receipt's order. Never deletes the receipt."""
+    with transaction.atomic():
+        receipt = PaymentReceipt.objects.select_for_update().select_related("payment__order").get(pk=receipt.pk)
+        order = Order.objects.select_for_update().get(pk=receipt.payment.order_id)
+        if receipt.status != PaymentReceipt.Status.PENDING or order.status != S.PAYMENT_SUBMITTED:
+            return receipt
+        try:
+            reserve_for_order(order)  # savepoint; idempotent for own reservations
+            receipt.reservation_status = PaymentReceipt.ReservationStatus.RESERVED
+            receipt.reservation_detail = {}
+        except ReservationConflict as exc:
+            receipt.reservation_status = PaymentReceipt.ReservationStatus.CONFLICT
+            receipt.reservation_detail = exc.details
+            order.flag_for_review("Inventory reservation failed after receipt upload.")
+            logger.warning("Reservation conflict for order %s: %s", order.number, exc.details)
+        receipt.save(update_fields=["reservation_status", "reservation_detail", "updated_at"])
+    return receipt
+
+
+def retry_unreserved_receipts(min_age_seconds=60):
+    """Scheduled job: recover receipts whose reservation attempt never completed."""
+    from datetime import timedelta
+
+    cutoff = timezone.now() - timedelta(seconds=min_age_seconds)
+    ids = PaymentReceipt.objects.filter(
+        status=PaymentReceipt.Status.PENDING,
+        reservation_status=PaymentReceipt.ReservationStatus.NOT_ATTEMPTED,
+        created_at__lt=cutoff,
+    ).values_list("pk", flat=True)
+    done = 0
+    for pk in list(ids):
+        try:
+            attempt_reservation(PaymentReceipt(pk=pk))
+            done += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("Reservation retry failed for receipt %s", pk)
+    return done
 
 
 def _notify_customer(order, approved, reason=""):
@@ -121,8 +167,9 @@ def approve_receipt(receipt, reviewer, note=""):
             convert_for_order(order)
     except ReservationConflict as exc:
         raise ConflictError(
-            "Cannot approve: some items could not be reserved. Resolve inventory or reject the payment.",
-            code="reservation_conflict",
+            "Cannot approve: some items could not be reserved or were marked unavailable by an administrator. "
+            "Resolve inventory or reject the payment.",
+            code=exc.code,
             details=exc.details,
         ) from exc
     now = timezone.now()

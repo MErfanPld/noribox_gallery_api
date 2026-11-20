@@ -58,11 +58,20 @@ def reserve_for_order(order):
             own = set(
                 Reservation.objects.filter(order=order, status=Reservation.Status.ACTIVE).values_list("variant_id", flat=True)
             )
+            # A unit reserved by this order must still be 'reserved': if an admin
+            # independently marked it unavailable, that decision wins and the
+            # old reservation can no longer be turned into a sale.
+            overridden = [vid for vid in variant_ids if vid in own and rows[vid].state != AvailabilityState.RESERVED]
             conflicts = [
                 vid for vid in variant_ids if vid not in own and rows[vid].state != AvailabilityState.AVAILABLE
             ]
-            if conflicts:
-                raise ReservationConflict(details={"unavailable_variant_ids": conflicts})
+            if conflicts or overridden:
+                raise ReservationConflict(
+                    "Some items were marked unavailable by an administrator." if overridden and not conflicts else None,
+                    code="admin_marked_unavailable" if overridden and not conflicts else None,
+                    details={"unavailable_variant_ids": sorted(conflicts + overridden),
+                             "admin_unavailable_variant_ids": overridden},
+                )
             created = []
             for vid in variant_ids:
                 if vid in own:
@@ -108,11 +117,37 @@ def release_for_order(order, reason="released"):
 
 
 def convert_for_order(order):
-    """Turn the order's reservations into a completed sale (variants become unavailable)."""
-    active = Reservation.objects.filter(order=order, status=Reservation.Status.ACTIVE).count()
-    if active != order.items.count():
-        raise ReservationConflict("Order is not fully reserved.", code="not_reserved")
-    return _close(order, Reservation.Status.CONVERTED, "payment approved", AvailabilityState.UNAVAILABLE)
+    """Turn the order's reservations into a completed sale (variants become unavailable).
+
+    Re-validates under row locks that every unit is still 'reserved' (not
+    overridden by an administrator) before selling.
+    """
+    with transaction.atomic():
+        active = list(Reservation.objects.select_for_update().filter(order=order, status=Reservation.Status.ACTIVE))
+        if len(active) != order.items.count():
+            raise ReservationConflict("Order is not fully reserved.", code="not_reserved")
+        rows = _lock([r.variant_id for r in active])
+        overridden = [vid for vid, row in rows.items() if row.state != AvailabilityState.RESERVED]
+        if overridden:
+            raise ReservationConflict(
+                "Some items were marked unavailable by an administrator.", code="admin_marked_unavailable",
+                details={"unavailable_variant_ids": overridden, "admin_unavailable_variant_ids": overridden},
+            )
+        return _close(order, Reservation.Status.CONVERTED, "payment approved", AvailabilityState.UNAVAILABLE)
+
+
+def return_sold_units(order):
+    """Paid order cancelled: units stay unavailable (unsold) until an admin restocks them."""
+    variant_ids = [vid for vid in order.items.values_list("variant_id", flat=True) if vid]
+    with transaction.atomic():
+        rows = _lock(variant_ids)
+        for row in rows.values():
+            if row.sold:
+                row.sold = False
+                row.state = AvailabilityState.UNAVAILABLE
+                row.note = f"Returned from cancelled order {order.number}; restock manually if sellable"
+                row.save(update_fields=["sold", "state", "note", "updated_at"])
+    return len(rows)
 
 
 def expire_reservations(now=None):
@@ -123,11 +158,20 @@ def expire_reservations(now=None):
     order_ids = set(
         Reservation.objects.filter(status=Reservation.Status.ACTIVE, expires_at__lt=now).values_list("order_id", flat=True)
     )
-    for order in Order.objects.filter(pk__in=order_ids):
-        _close(order, Reservation.Status.EXPIRED, "reservation expired")
-        order.flag_for_review("Reservation expired before payment review.")
-        logger.info("Reservation expired for order %s", order.number)
-    return order_ids
+    flagged = set()
+    for order_id in order_ids:
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(pk=order_id)
+            # Re-check under lock: only still-active, still-overdue reservations.
+            overdue = Reservation.objects.filter(order=order, status=Reservation.Status.ACTIVE, expires_at__lt=now).exists()
+            if not overdue:
+                continue
+            closed = _close(order, Reservation.Status.EXPIRED, "reservation expired")
+            if closed and order.status == Order.Status.PAYMENT_SUBMITTED:
+                order.flag_for_review("Reservation expired before payment review.")
+                flagged.add(order_id)
+            logger.info("Reservation expired for order %s (%s units)", order.number, closed)
+    return flagged
 
 
 def set_availability(variant, state, user=None, note=""):

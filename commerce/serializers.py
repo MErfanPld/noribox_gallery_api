@@ -59,6 +59,19 @@ class AddCartItemSerializer(serializers.Serializer):
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+
+    def get_image_url(self, obj) -> str | None:
+        url = obj.image_url
+        if not url:
+            return None
+        if not url.startswith(("/", "http://", "https://")):  # legacy rows stored the storage name
+            from django.conf import settings
+
+            url = settings.MEDIA_URL.rstrip("/") + "/" + url
+        request = self.context.get("request")
+        return request.build_absolute_uri(url) if request and url.startswith("/") else url
+
     class Meta:
         model = OrderItem
         fields = ["id", "variant", "product_name", "product_slug", "sku", "variant_label", "image_url",
@@ -113,7 +126,8 @@ class AdminOrderSerializer(OrderDetailSerializer):
     history = serializers.SerializerMethodField()
 
     class Meta(OrderDetailSerializer.Meta):
-        fields = ["id", "user", "user_phone", *OrderDetailSerializer.Meta.fields, "admin_note", "needs_review", "review_reason", "updated_at"]
+        fields = ["id", "user", "user_phone", *OrderDetailSerializer.Meta.fields, "admin_note", "needs_review", "review_reason",
+                  "refund_status", "refund_reference", "refunded_at", "updated_at"]
         read_only_fields = [f for f in fields if f not in ("admin_note",)]
 
     def get_history(self, obj) -> list:
@@ -122,6 +136,11 @@ class AdminOrderSerializer(OrderDetailSerializer):
              "changed_by": h.changed_by.phone if h.changed_by else None}
             for h in obj.status_history.all()
         ]
+
+
+class RecordRefundSerializer(serializers.Serializer):
+    reference = serializers.CharField(max_length=100)
+    note = serializers.CharField(required=False, allow_blank=True, max_length=300)
 
 
 class AdminTransitionSerializer(serializers.Serializer):

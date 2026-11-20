@@ -111,7 +111,8 @@ class AdminOrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins
     filterset_fields = ["status", "needs_review", "user"]
     search_fields = ["number", "user__phone", "recipient_name", "recipient_phone"]
     ordering_fields = ["created_at", "total", "paid_at"]
-    action_perms = {"transition": ["commerce.manage_order_status"], "clear_review": ["commerce.manage_order_status"]}
+    action_perms = {"transition": ["commerce.manage_order_status"], "clear_review": ["commerce.manage_order_status"],
+                    "record_refund": ["commerce.record_refund"]}
     queryset = Order.objects.select_related("user", "shipment").prefetch_related(
         "items", "status_history__changed_by", "payments__receipts__reviews"
     )
@@ -124,6 +125,15 @@ class AdminOrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins
         ser.is_valid(raise_exception=True)
         services.admin_transition(order, ser.validated_data["status"], request.user, ser.validated_data.get("note", ""))
         return Response(self.get_serializer(self.get_queryset().get(pk=order.pk)).data)
+
+    @extend_schema(request=s.RecordRefundSerializer, responses=s.AdminOrderSerializer)
+    @action(detail=True, methods=["post"], url_path="record-refund")
+    def record_refund(self, request, pk=None):
+        """Record a refund that was made manually (bank transfer) for a cancelled paid order."""
+        ser = s.RecordRefundSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        services.record_refund(self.get_object(), request.user, ser.validated_data["reference"], ser.validated_data.get("note", ""))
+        return Response(self.get_serializer(self.get_queryset().get(pk=pk)).data)
 
     @extend_schema(request=None, responses=s.AdminOrderSerializer)
     @action(detail=True, methods=["post"], url_path="clear-review")

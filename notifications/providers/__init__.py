@@ -1,5 +1,6 @@
 """Provider-independent SMS layer. Select with SMS_PROVIDER."""
 import json
+import re
 import logging
 from dataclasses import dataclass
 from urllib.parse import quote, urlencode
@@ -33,7 +34,9 @@ class ConsoleProvider(BaseSMSProvider):
     name = "console"
 
     def send(self, phone, message, template=None, context=None):
-        logger.info("[SMS to %s] %s", phone, message)
+        # Only show bodies (which may contain OTP codes) in DEBUG; mask digits otherwise.
+        shown = message if settings.DEBUG else re.sub(r"\d", "*", message)
+        logger.info("[SMS to %s] %s", phone, shown)
         return SendResult("console")
 
 

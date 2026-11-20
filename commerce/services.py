@@ -47,7 +47,11 @@ def is_purchasable(variant):
 
 
 def get_cart(user):
-    cart, _ = Cart.objects.get_or_create(user=user)
+    try:
+        with transaction.atomic():
+            cart, _ = Cart.objects.get_or_create(user=user)
+    except IntegrityError:  # concurrent first request
+        cart = Cart.objects.get(user=user)
     return cart
 
 
@@ -149,7 +153,7 @@ def create_order(user, address, shipping_method, customer_note=""):
                 product_slug=v.product.slug,
                 sku=v.sku,
                 variant_label=v.display_label,
-                image_url=images[0].image.name if images else "",
+                image_url=images[0].image.url if images else "",
                 unit_price=v.price,
                 compare_at_price=v.compare_at_price,
                 line_total=v.price,
@@ -166,20 +170,57 @@ def create_order(user, address, shipping_method, customer_note=""):
 
 
 @transaction.atomic
-def cancel_order(order, user=None, note="", by_admin=False):
-    from inventory.services import release_for_order
-    from payments.models import Payment
+def cancel_order(order, user=None, note="", by_admin=False, only_if_status=None):
+    """Cancel an order under a row lock.
+
+    ``only_if_status`` restricts cancellation to orders that are *still* in that
+    status once locked (used by the scheduled job). Returns the order, or None
+    when ``only_if_status`` no longer matches.
+    """
+    from inventory.services import release_for_order, return_sold_units
+    from payments.models import Payment, PaymentReceipt
 
     order = Order.objects.select_for_update().get(pk=order.pk)
+    if only_if_status is not None and order.status != only_if_status:
+        return None
     allowed = ADMIN_TRANSITIONS[order.status] if by_admin else {S.CANCELLED} if order.status == S.AWAITING_PAYMENT else set()
     if S.CANCELLED not in allowed:
         raise ConflictError("Order cannot be cancelled in its current state.", code="invalid_transition")
-    release_for_order(order, reason="order cancelled")
-    Payment.objects.filter(order=order).exclude(status=Payment.Status.APPROVED).update(status=Payment.Status.CANCELLED)
+    was_paid = order.status in (S.PAID, S.PROCESSING)
+    if was_paid:
+        # Units were sold; keep them unavailable until an admin restocks them.
+        return_sold_units(order)
+        order.refund_status = Order.RefundStatus.PENDING
+        order.save(update_fields=["refund_status", "updated_at"])
+    else:
+        release_for_order(order, reason="order cancelled")
+    payments = Payment.objects.select_for_update().filter(order=order).exclude(status=Payment.Status.APPROVED)
+    PaymentReceipt.objects.filter(payment__order=order, status=PaymentReceipt.Status.PENDING).update(
+        status=PaymentReceipt.Status.CANCELLED, updated_at=timezone.now()
+    )
+    payments.update(status=Payment.Status.CANCELLED, updated_at=timezone.now())
     if hasattr(order, "shipment"):
         order.shipment.status = order.shipment.Status.CANCELLED
         order.shipment.save(update_fields=["status", "updated_at"])
+    if was_paid:
+        note = f"{note or 'Cancelled'} (refund pending — record it once the transfer is made)"
     return set_status(order, S.CANCELLED, user, note or "Cancelled")
+
+
+@transaction.atomic
+def record_refund(order, user, reference, note=""):
+    """Record a manually executed refund. Never marks a refund without a reference."""
+    order = Order.objects.select_for_update().get(pk=order.pk)
+    if order.refund_status != Order.RefundStatus.PENDING:
+        raise ConflictError("No refund is pending for this order.", code="no_refund_pending")
+    if not reference or not reference.strip():
+        raise ServiceError("A bank transfer reference is required.", code="reference_required")
+    order.refund_status = Order.RefundStatus.REFUNDED
+    order.refund_reference = reference.strip()[:100]
+    order.refunded_at, order.refunded_by = timezone.now(), user
+    order.save(update_fields=["refund_status", "refund_reference", "refunded_at", "refunded_by", "updated_at"])
+    record_status(order, order.status, order.status, user, f"Refund recorded: {order.refund_reference} {note}".strip())
+    return order
 
 
 @transaction.atomic
@@ -211,16 +252,32 @@ def admin_transition(order, to_status, user, note=""):
 
 
 def cancel_stale_unpaid_orders(now=None):
-    """Scheduled job: cancel orders left awaiting payment beyond UNPAID_ORDER_TTL_HOURS."""
+    """Scheduled job: cancel orders left awaiting payment beyond UNPAID_ORDER_TTL_HOURS.
+
+    Each order is re-checked under a row lock, so a receipt upload (which locks
+    the same row and moves the order to payment_submitted) can never be
+    invalidated: whichever transaction locks first wins, and the other sees
+    the new state.
+    """
     from datetime import timedelta
+
+    from payments.models import PaymentReceipt
 
     now = now or timezone.now()
     cutoff = now - timedelta(hours=settings.UNPAID_ORDER_TTL_HOURS)
     cancelled = []
-    for order in Order.objects.filter(status=S.AWAITING_PAYMENT, created_at__lt=cutoff):
-        # Skip orders that had a rejected receipt recently (customer may resubmit).
-        if order.payments.filter(receipts__created_at__gte=cutoff).exists():
-            continue
-        cancel_order(order, None, "Automatically cancelled: unpaid", by_admin=True)
-        cancelled.append(order.number)
+    candidates = Order.objects.filter(status=S.AWAITING_PAYMENT, created_at__lt=cutoff).values_list("pk", flat=True)
+    for pk in list(candidates):
+        with transaction.atomic():
+            order = Order.objects.select_for_update().filter(pk=pk).first()
+            if order is None or order.status != S.AWAITING_PAYMENT or order.created_at >= cutoff:
+                continue
+            receipts = PaymentReceipt.objects.filter(payment__order=order)
+            # Never cancel while a receipt is pending, or shortly after a rejection
+            # (the customer may resubmit).
+            if receipts.filter(status=PaymentReceipt.Status.PENDING).exists() or receipts.filter(created_at__gte=cutoff).exists():
+                continue
+            if cancel_order(order, None, "Automatically cancelled: unpaid", by_admin=True,
+                            only_if_status=S.AWAITING_PAYMENT) is not None:
+                cancelled.append(order.number)
     return cancelled

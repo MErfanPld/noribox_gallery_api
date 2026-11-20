@@ -1,4 +1,5 @@
-from django.db.models import Exists, OuterRef, Prefetch, Subquery
+from django.db import transaction
+from django.db.models import Exists, ProtectedError, OuterRef, Prefetch, Subquery
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
@@ -14,7 +15,7 @@ from catalog.models import (
     Attribute, AttributeOption, Brand, Category, CategoryAttribute, Product, ProductAttributeValue,
     ProductImage, ProductVariant,
 )
-from core.exceptions import ServiceError
+from core.exceptions import ConflictError, ServiceError, protected_conflict
 from core.permissions import AdminModelPermission
 
 
@@ -121,6 +122,15 @@ class AdminCategoryViewSet(AdminViewSet):
     filterset_fields = ["is_active", "parent"]
     search_fields = ["name", "slug"]
 
+    def perform_destroy(self, instance):
+        try:
+            with transaction.atomic():
+                instance.delete()
+        except ProtectedError as exc:
+            raise protected_conflict(
+                exc, "Move its products/subcategories first, or deactivate it (PATCH is_active=false)."
+            ) from exc
+
 
 class AdminBrandViewSet(AdminViewSet):
     queryset = Brand.objects.all()
@@ -174,6 +184,25 @@ class AdminProductViewSet(AdminViewSet):
         product.status = status
         product.save(update_fields=["status", "published_at", "updated_at"])
         return Response(self.get_serializer(product).data)
+
+    def perform_destroy(self, instance):
+        # Sold/ordered/reserved units are business history: never hard-delete them.
+        from commerce.models import OrderItem
+        from inventory.models import Reservation
+
+        if OrderItem.objects.filter(variant__product=instance).exists() or Reservation.objects.filter(
+            variant__product=instance
+        ).exists():
+            raise ConflictError(
+                "This product has orders or reservations and cannot be deleted. Archive it instead "
+                f"(POST /api/admin/products/{instance.pk}/archive/).",
+                code="protected", details={"safe_alternative": "archive"},
+            )
+        try:
+            with transaction.atomic():
+                instance.delete()
+        except ProtectedError as exc:
+            raise protected_conflict(exc, "Archive the product instead.") from exc
 
     @action(detail=True, methods=["post"])
     def publish(self, request, pk=None):

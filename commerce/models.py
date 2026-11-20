@@ -60,12 +60,24 @@ class Order(TimeStampedModel):
     admin_note = models.TextField(blank=True, default="")
     needs_review = models.BooleanField(default=False, db_index=True)
     review_reason = models.CharField(max_length=500, blank=True, default="")
+    class RefundStatus(models.TextChoices):
+        NONE = "none", "No refund"
+        PENDING = "pending", "Refund pending (manual transfer required)"
+        REFUNDED = "refunded", "Refund recorded"
+
+    refund_status = models.CharField(max_length=20, choices=RefundStatus.choices, default=RefundStatus.NONE, db_index=True)
+    refund_reference = models.CharField(max_length=100, blank=True, default="")
+    refunded_at = models.DateTimeField(null=True, blank=True)
+    refunded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     paid_at = models.DateTimeField(null=True, blank=True)
     cancelled_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
-        permissions = [("manage_order_status", "Can change order status")]
+        permissions = [
+            ("manage_order_status", "Can change order status"),
+            ("record_refund", "Can record manual refunds"),
+        ]
         constraints = [
             models.CheckConstraint(
                 condition=Q(total=models.F("subtotal") + models.F("shipping_cost") - models.F("discount_total")),

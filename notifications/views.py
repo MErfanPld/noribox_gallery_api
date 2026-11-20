@@ -59,5 +59,5 @@ class AdminSMSLogViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, views
         log = self.get_object()
         if log.status not in (SMSLog.Status.FAILED, SMSLog.Status.GAVE_UP) or log.message == "[redacted]":
             raise ConflictError("Only failed, non-sensitive messages can be retried.", code="not_retryable")
-        log = _attempt(log, SMSTemplate.objects.filter(code=log.template_code).first())
+        log = _attempt(log, SMSTemplate.objects.filter(code=log.template_code).first())  # non-sensitive only
         return Response(SMSLogSerializer(log).data)
