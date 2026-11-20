@@ -97,6 +97,9 @@ ADDRESS_FIELDS = ["recipient_name", "recipient_phone", "province", "city", "addr
 
 class OrderDetailSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
+    payment_expires_at = serializers.SerializerMethodField(
+        help_text="Deadline for uploading a receipt (server-computed); null unless awaiting payment."
+    )
     history = OrderStatusHistorySerializer(source="status_history", many=True, read_only=True)
     shipment = ShipmentSerializer(read_only=True)
     payment = serializers.SerializerMethodField()
@@ -105,7 +108,14 @@ class OrderDetailSerializer(serializers.ModelSerializer):
         model = Order
         fields = ["number", "status", *ADDRESS_FIELDS, "shipping_method_name", "subtotal", "shipping_cost",
                   "discount_total", "total", "customer_note", "items", "shipment", "payment", "history",
-                  "created_at", "paid_at", "cancelled_at"]
+                  "created_at", "paid_at", "cancelled_at", "payment_expires_at"]
+
+    @extend_schema_field(serializers.DateTimeField(allow_null=True))
+    def get_payment_expires_at(self, obj):
+        from commerce.services import payment_deadline
+
+        deadline = payment_deadline(obj)
+        return serializers.DateTimeField().to_representation(deadline) if deadline else None
 
     @extend_schema_field(PaymentSerializer(allow_null=True))
     def get_payment(self, obj):
@@ -146,3 +156,76 @@ class RecordRefundSerializer(serializers.Serializer):
 class AdminTransitionSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=Order.Status.choices)
     note = serializers.CharField(required=False, allow_blank=True, max_length=500)
+
+
+# --- guest order tracking (public, deliberately limited) ---------------------
+def mask_name(name: str) -> str:
+    return " ".join(f"{part[0]}***" for part in (name or "").split() if part)
+
+
+class TrackOrderRequestSerializer(serializers.Serializer):
+    number = serializers.CharField(max_length=20, trim_whitespace=True)
+    phone = serializers.CharField(max_length=20)
+
+    def validate_number(self, value):
+        return value.strip().upper()
+
+    def validate_phone(self, value):
+        from core.utils import normalize_phone
+
+        try:
+            return normalize_phone(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+
+
+class TrackedOrderItemSerializer(OrderItemSerializer):
+    class Meta(OrderItemSerializer.Meta):
+        fields = ["product_name", "variant_label", "image_url", "unit_price"]
+
+
+class TrackedOrderSerializer(serializers.ModelSerializer):
+    """Public tracking view: no address line, postal code, phones, receipts, notes or refund data."""
+
+    payment_status = serializers.SerializerMethodField()
+    payment_expires_at = serializers.SerializerMethodField()
+    item_count = serializers.SerializerMethodField()
+    items = TrackedOrderItemSerializer(many=True, read_only=True)
+    recipient_name = serializers.SerializerMethodField()
+    shipment = serializers.SerializerMethodField()
+    timeline = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Order
+        fields = ["number", "status", "payment_status", "created_at", "paid_at", "payment_expires_at", "total",
+                  "item_count", "items", "recipient_name", "province", "city", "shipping_method_name", "shipment",
+                  "timeline"]
+
+    def get_payment_status(self, obj) -> str | None:
+        from payments.services import current_payment
+
+        payment = current_payment(obj)
+        return payment.status if payment else None
+
+    @extend_schema_field(serializers.DateTimeField(allow_null=True))
+    def get_payment_expires_at(self, obj):
+        from commerce.services import payment_deadline
+
+        deadline = payment_deadline(obj)
+        return serializers.DateTimeField().to_representation(deadline) if deadline else None
+
+    def get_item_count(self, obj) -> int:
+        return len(obj.items.all())
+
+    def get_recipient_name(self, obj) -> str:
+        return mask_name(obj.recipient_name)
+
+    def get_shipment(self, obj) -> dict | None:
+        s = getattr(obj, "shipment", None)
+        if s is None:
+            return None
+        return {"status": s.status, "carrier": s.carrier, "tracking_code": s.tracking_code, "tracking_url": s.tracking_url,
+                "shipped_at": s.shipped_at, "delivered_at": s.delivered_at}
+
+    def get_timeline(self, obj) -> list:
+        return [{"status": h.to_status, "at": h.created_at} for h in obj.status_history.all()]

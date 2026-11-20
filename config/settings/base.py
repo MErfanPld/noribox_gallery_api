@@ -143,6 +143,7 @@ REST_FRAMEWORK = {
         "otp_request": env("THROTTLE_OTP_REQUEST", "5/min"),
         "otp_verify": env("THROTTLE_OTP_VERIFY", "10/min"),
         "receipt_upload": env("THROTTLE_RECEIPT_UPLOAD", "10/hour"),
+        "order_track": env("THROTTLE_ORDER_TRACK", "10/min"),
     },
     "TEST_REQUEST_DEFAULT_FORMAT": "json",
 }
@@ -237,6 +238,9 @@ OTP_LOGIN_AUTO_REGISTER = env_bool("OTP_LOGIN_AUTO_REGISTER", True)
 RESERVATION_TTL_HOURS = env_int("RESERVATION_TTL_HOURS", 72)
 UNPAID_ORDER_TTL_HOURS = env_int("UNPAID_ORDER_TTL_HOURS", 48)
 ORDER_MAX_ITEMS = env_int("ORDER_MAX_ITEMS", 50)
+# Guest tracking: failed number+phone attempts per order number before a temporary lock
+ORDER_TRACK_MAX_FAILURES = env_int("ORDER_TRACK_MAX_FAILURES", 5)
+ORDER_TRACK_FAILURE_WINDOW_SECONDS = env_int("ORDER_TRACK_FAILURE_WINDOW_SECONDS", 900)
 
 # Receipts
 RECEIPT_MAX_SIZE_BYTES = env_int("RECEIPT_MAX_SIZE_BYTES", 5 * 1024 * 1024)

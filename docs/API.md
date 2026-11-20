@@ -86,8 +86,13 @@ Product detail (abridged):
 | POST | `orders/` | `{address_id, shipping_method_id, customer_note?}` → order from cart (no reservation) |
 | GET | `orders/`, `orders/{number}/` | detail includes items, shipment, payment + receipts, history |
 | POST | `orders/{number}/cancel/` | only while `awaiting_payment` |
+| POST | `orders/track/` | **public** guest tracking `{number, phone}` — phone of the account owner or the order's recipient. Limited output (status, payment status, `payment_expires_at`, totals, items, masked recipient name, province/city, shipment tracking, timeline). Unknown order and wrong phone both → 404 `order_not_found`; throttled per IP (`THROTTLE_ORDER_TRACK`) and locked per order number after `ORDER_TRACK_MAX_FAILURES` → 429 `track_locked` |
 | POST | `orders/{number}/receipts/` | multipart: `file` (jpg/png/webp/pdf ≤ 5 MB, signature checked), `reference_number?`, `payer_card_last4?`, `paid_at?`, `declared_amount?`, `customer_note?` |
 | GET | `receipts/{id}/file/` | streams the owner's receipt (`Cache-Control: private, no-store`). Requires the Bearer token — fetch it and render via a blob URL |
+
+`payment_expires_at` (order detail, admin, tracking): server-computed receipt deadline =
+max(created_at, last receipt upload) + `UNPAID_ORDER_TTL_HOURS`; `null` unless `awaiting_payment`.
+The same function drives automatic cancellation, so the countdown and the server always agree.
 
 Order status flow:
 `awaiting_payment → payment_submitted (receipt) → paid (approved) → processing → shipped → delivered`;
@@ -144,3 +149,10 @@ OTP messages are never stored in plaintext in `SMSLog` and are not retried.
 | `protected` | delete refused because orders/reservations/children reference the object; `details.referenced_by`, use archive/deactivate |
 | `invalid_transition`, `invalid_order_state`, `receipt_pending`, `receipt_not_pending` | state-machine guards |
 | `phone_registered` | concurrent/duplicate registration |
+
+## Perfume note pyramid (data, no schema change)
+
+`python manage.py seed_perfume_attributes --category perfume` creates three filterable
+`multi_option` attributes: `notes_top`, `notes_heart`, `notes_base`. Each note is an
+AttributeOption (reusable, filterable: `?options=notes_base:oud`). Product detail returns them
+in `attributes[]`; the frontend perfume extension assembles them into the pyramid.

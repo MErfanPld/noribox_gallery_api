@@ -1,7 +1,8 @@
+from django.conf import settings
 from django.db.models import Prefetch
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import extend_schema
-from rest_framework import mixins, status, viewsets
+from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -11,8 +12,10 @@ from catalog.models import ProductImage
 from commerce import serializers as s
 from commerce import services
 from commerce.models import Cart, CartItem, Order
+from core import ratelimit
 from core.exceptions import ServiceError
 from core.permissions import AdminModelPermission
+from core.throttling import ScopedRateThrottle
 from shipping.models import ShippingMethod
 
 
@@ -103,6 +106,56 @@ class OrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.Ge
 
 
 OrderViewSet.http_method_names = ["get", "post", "head", "options"]
+
+
+class TrackOrderView(APIView):
+    """Guest order tracking by order number + phone (account owner's or the order's recipient).
+
+    Unknown orders and wrong phones get the same 404. Throttled per client IP
+    and locked per order number after repeated failures.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    throttle_scope = "order_track"
+
+    def get_throttles(self):
+        return [ScopedRateThrottle(), *super().get_throttles()]
+
+    @extend_schema(tags=["orders"], request=s.TrackOrderRequestSerializer, responses={200: s.TrackedOrderSerializer})
+    def post(self, request):
+        ser = s.TrackOrderRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        number, phone = ser.validated_data["number"], ser.validated_data["phone"]
+        if ratelimit.is_locked("order_track", number, settings.ORDER_TRACK_MAX_FAILURES):
+            raise ServiceError("Too many attempts. Try again later.", code="track_locked",
+                               status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+        order = (
+            Order.objects.select_related("user", "shipment")
+            .prefetch_related("items", "status_history", "payments__receipts")
+            .filter(number=number).first()
+        )
+        if order is None or not _phone_matches(order, phone):
+            ratelimit.register_failure("order_track", number, settings.ORDER_TRACK_FAILURE_WINDOW_SECONDS)
+            raise ServiceError("Order not found.", code="order_not_found", status_code=status.HTTP_404_NOT_FOUND)
+        ratelimit.reset("order_track", number)
+        return Response(s.TrackedOrderSerializer(order, context={"request": request}).data)
+
+
+def _phone_matches(order, phone):
+    import hmac
+
+    from core.utils import normalize_phone
+
+    candidates = [order.user.phone, order.recipient_phone]
+    matched = False
+    for candidate in candidates:
+        try:
+            normalized = normalize_phone(candidate)
+        except ValueError:
+            continue
+        matched |= hmac.compare_digest(normalized, phone)  # evaluate all candidates (no early exit)
+    return matched
 
 
 class AdminOrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin, viewsets.GenericViewSet):

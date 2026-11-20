@@ -251,6 +251,33 @@ def admin_transition(order, to_status, user, note=""):
     return set_status(order, to_status, user, note)
 
 
+def last_receipt_at(order):
+    """Most recent receipt upload time (uses prefetched payments/receipts when available)."""
+    latest = None
+    for payment in order.payments.all():
+        for receipt in payment.receipts.all():
+            if latest is None or receipt.created_at > latest:
+                latest = receipt.created_at
+    return latest
+
+
+def payment_deadline(order, latest_receipt_at=None):
+    """When an unpaid order becomes eligible for automatic cancellation.
+
+    Single source of truth for both the API (``payment_expires_at``) and
+    ``cancel_stale_unpaid_orders``: max(created_at, last receipt upload) +
+    UNPAID_ORDER_TTL_HOURS. Only defined while the order awaits payment.
+    """
+    from datetime import timedelta
+
+    if order.status != S.AWAITING_PAYMENT:
+        return None
+    if latest_receipt_at is None:
+        latest_receipt_at = last_receipt_at(order)
+    base = max(order.created_at, latest_receipt_at) if latest_receipt_at else order.created_at
+    return base + timedelta(hours=settings.UNPAID_ORDER_TTL_HOURS)
+
+
 def cancel_stale_unpaid_orders(now=None):
     """Scheduled job: cancel orders left awaiting payment beyond UNPAID_ORDER_TTL_HOURS.
 
@@ -273,9 +300,13 @@ def cancel_stale_unpaid_orders(now=None):
             if order is None or order.status != S.AWAITING_PAYMENT or order.created_at >= cutoff:
                 continue
             receipts = PaymentReceipt.objects.filter(payment__order=order)
-            # Never cancel while a receipt is pending, or shortly after a rejection
-            # (the customer may resubmit).
-            if receipts.filter(status=PaymentReceipt.Status.PENDING).exists() or receipts.filter(created_at__gte=cutoff).exists():
+            # Never cancel while a receipt is pending; otherwise use the same
+            # deadline the API exposes (a rejection restarts the payment window).
+            if receipts.filter(status=PaymentReceipt.Status.PENDING).exists():
+                continue
+            latest = receipts.order_by("-created_at").values_list("created_at", flat=True).first()
+            deadline = payment_deadline(order, latest)
+            if deadline is None or deadline > now:
                 continue
             if cancel_order(order, None, "Automatically cancelled: unpaid", by_admin=True,
                             only_if_status=S.AWAITING_PAYMENT) is not None:
