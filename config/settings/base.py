@@ -120,7 +120,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # --- DRF / JWT / OpenAPI ----------------------------------------------------
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "accounts.authentication.JWTAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
     "DEFAULT_PAGINATION_CLASS": "core.pagination.StandardPagination",
@@ -133,8 +133,8 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "core.schema.NoriboxAutoSchema",
     "EXCEPTION_HANDLER": "core.exceptions.api_exception_handler",
     "DEFAULT_THROTTLE_CLASSES": [
-        "rest_framework.throttling.AnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
+        "core.throttling.AnonRateThrottle",
+        "core.throttling.UserRateThrottle",
     ],
     "DEFAULT_THROTTLE_RATES": {
         "anon": env("THROTTLE_ANON", "120/min"),
@@ -180,6 +180,25 @@ SPECTACULAR_SETTINGS = {
     "SECURITY": [{"jwtAuth": []}],
 }
 
+# --- Cache (shared across workers: throttling, login lockout, job locks) -----
+REDIS_URL = env("REDIS_URL", "")
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": env("CACHE_KEY_PREFIX", "noribox"),
+            "TIMEOUT": 300,
+        }
+    }
+else:  # development only; prod settings require REDIS_URL
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+
+# --- Reverse proxy -------------------------------------------------------------
+# CIDRs of reverse proxies allowed to set X-Real-IP / X-Forwarded-For.
+# Empty = trust nobody (REMOTE_ADDR is the client).
+TRUSTED_PROXIES = env_list("TRUSTED_PROXIES", "")
+
 # --- CORS / CSRF ------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
 CORS_ALLOW_CREDENTIALS = False
@@ -202,6 +221,10 @@ LOGGING = {
 }
 
 # --- Business configuration -------------------------------------------------
+# Failed password logins per phone (shared cache)
+LOGIN_MAX_FAILURES = env_int("LOGIN_MAX_FAILURES", 10)
+LOGIN_FAILURE_WINDOW_SECONDS = env_int("LOGIN_FAILURE_WINDOW_SECONDS", 900)
+
 # OTP
 OTP_LENGTH = env_int("OTP_LENGTH", 6)
 OTP_TTL_SECONDS = env_int("OTP_TTL_SECONDS", 120)
@@ -228,6 +251,8 @@ SMS_SENDER = env("SMS_SENDER", "")
 SMS_MAX_ATTEMPTS = env_int("SMS_MAX_ATTEMPTS", 3)
 SMS_RETRY_BASE_SECONDS = env_int("SMS_RETRY_BASE_SECONDS", 60)
 SMS_ADMIN_PHONES = env_list("SMS_ADMIN_PHONES", "")
+# Queue non-OTP notifications for the scheduled job instead of sending in-request.
+SMS_ASYNC_NOTIFICATIONS = env_bool("SMS_ASYNC_NOTIFICATIONS", True)
 SMS_TIMEOUT_SECONDS = env_int("SMS_TIMEOUT_SECONDS", 10)
 
 # Source import (existing parser/importer)
@@ -236,6 +261,10 @@ SOURCE_BASE_URL = env("SOURCE_BASE_URL", "https://mehrdadgallery.com")
 IMPORT_DEFAULT_LIMIT = env_int("IMPORT_DEFAULT_LIMIT", 0) or None
 IMPORT_REQUEST_TIMEOUT = env_int("IMPORT_REQUEST_TIMEOUT", 15)
 IMPORT_MAX_PAGES = env_int("IMPORT_MAX_PAGES", 50)
+IMPORT_MAX_PAGE_BYTES = env_int("IMPORT_MAX_PAGE_BYTES", 5 * 1024 * 1024)
+IMPORT_STALE_MINUTES = env_int("IMPORT_STALE_MINUTES", 30)
+IMPORT_MAX_ATTEMPTS = env_int("IMPORT_MAX_ATTEMPTS", 2)
+OUTBOUND_ALLOWED_PORTS = [int(p) for p in env_list("OUTBOUND_ALLOWED_PORTS", "80,443")]
 IMPORT_USER_AGENT = env(
     "IMPORT_USER_AGENT",
     "Mozilla/5.0 (compatible; NoriboxImportBot/1.0)",

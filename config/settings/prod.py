@@ -1,11 +1,27 @@
+"""Production settings. Fails fast when required configuration is missing."""
 from django.core.exceptions import ImproperlyConfigured
 
 from .base import *  # noqa: F401,F403
-from .base import SECRET_KEY, env_bool, env_int
+from .base import DB_ENGINE, SECRET_KEY, env, env_bool, env_int, env_list
+
+
+def _require(name, value):
+    if not value:
+        raise ImproperlyConfigured(f"{name} must be set in production")
+    return value
+
 
 DEBUG = False
-if SECRET_KEY.startswith("django-insecure"):
-    raise ImproperlyConfigured("Set a strong DJANGO_SECRET_KEY in production")
+if not SECRET_KEY or SECRET_KEY.startswith("django-insecure") or len(SECRET_KEY) < 32:
+    raise ImproperlyConfigured("Set a strong DJANGO_SECRET_KEY (>= 32 chars) in production")
+
+ALLOWED_HOSTS = _require("DJANGO_ALLOWED_HOSTS", env_list("DJANGO_ALLOWED_HOSTS", ""))
+if "*" in ALLOWED_HOSTS:
+    raise ImproperlyConfigured("DJANGO_ALLOWED_HOSTS must not contain '*' in production")
+if DB_ENGINE != "postgresql":
+    raise ImproperlyConfigured("Production requires PostgreSQL (DB_ENGINE=postgresql)")
+_require("POSTGRES_PASSWORD", env("POSTGRES_PASSWORD", ""))
+_require("REDIS_URL", env("REDIS_URL", ""))  # shared throttling / lockout state across workers
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", True)

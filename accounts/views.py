@@ -1,5 +1,6 @@
 from django.contrib.auth.models import Group
-from django.db import transaction
+from django.db import IntegrityError, transaction
+from rest_framework.exceptions import ValidationError
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, mixins, permissions, status, viewsets
 from rest_framework.response import Response
@@ -10,8 +11,12 @@ from rest_framework_simplejwt.views import TokenRefreshView
 
 from accounts import serializers as s
 from accounts.models import Address, OTPCode, User
-from accounts.services import get_or_create_otp_user, mark_phone_verified, request_otp, verify_otp
-from core.exceptions import ServiceError
+from accounts.services import (
+    get_or_create_otp_user, mark_phone_verified, request_otp, set_password_and_revoke_tokens, verify_otp,
+)
+from core import ratelimit
+from core.exceptions import ConflictError, ServiceError
+from core.net import get_client_ip
 from core.permissions import AdminModelPermission
 
 
@@ -26,7 +31,7 @@ class AuthView(APIView):
     throttle_scope = "auth"
 
     def get_throttles(self):
-        from rest_framework.throttling import ScopedRateThrottle
+        from core.throttling import ScopedRateThrottle
 
         return [ScopedRateThrottle(), *super().get_throttles()]
 
@@ -40,11 +45,14 @@ class OTPRequestView(AuthView):
         ser.is_valid(raise_exception=True)
         phone, purpose = ser.validated_data["phone"], ser.validated_data["purpose"]
         exists = User.objects.filter(phone=phone).exists()
-        if purpose == OTPCode.Purpose.REGISTER and exists:
-            raise ServiceError("This phone is already registered.", code="phone_registered")
-        # For password reset, respond identically whether or not the account exists.
-        if not (purpose == OTPCode.Purpose.RESET_PASSWORD and not exists):
-            request_otp(phone, purpose, ip_address=request.META.get("REMOTE_ADDR"))
+        # Identical response whether or not the account exists (no enumeration):
+        # 'register' sends nothing to registered phones, 'reset_password' sends
+        # nothing to unknown phones. Login codes are always sent (auto-register).
+        skip = (purpose == OTPCode.Purpose.REGISTER and exists) or (
+            purpose == OTPCode.Purpose.RESET_PASSWORD and not exists
+        )
+        if not skip:
+            request_otp(phone, purpose, ip_address=get_client_ip(request) or None)
         from django.conf import settings
 
         return Response(
@@ -68,8 +76,19 @@ class OTPLoginView(AuthView):
 class PasswordLoginView(AuthView):
     @extend_schema(tags=["auth"], request=s.PasswordLoginSerializer, responses={200: s.TokenPairSerializer})
     def post(self, request):
+        phone_ser = s.OTPRequestSerializer(data={"phone": request.data.get("phone", "")})
+        phone = phone_ser.validated_data["phone"] if phone_ser.is_valid() else None
+        if phone and ratelimit.login_locked(phone):
+            raise ServiceError(
+                "Too many failed attempts for this account. Try again later or log in with a one-time code.",
+                code="login_locked", status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
         ser = s.PasswordLoginSerializer(data=request.data, context={"request": request})
-        ser.is_valid(raise_exception=True)
+        if not ser.is_valid():
+            if phone and "password" in request.data:
+                ratelimit.login_failed(phone)
+            raise ValidationError(ser.errors)
+        ratelimit.reset("login", phone)
         return _token_response(ser.validated_data["user"])
 
 
@@ -84,14 +103,17 @@ class RegisterView(AuthView):
         if User.objects.filter(phone=data["phone"]).exists():
             raise ServiceError("This phone is already registered.", code="phone_registered")
         verify_otp(data["phone"], OTPCode.Purpose.REGISTER, data["code"])
-        with transaction.atomic():
-            user = User.objects.create_user(
-                phone=data["phone"],
-                password=data["password"],
-                first_name=data.get("first_name", ""),
-                last_name=data.get("last_name", ""),
-            )
-            mark_phone_verified(user)
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    phone=data["phone"],
+                    password=data["password"],
+                    first_name=data.get("first_name", ""),
+                    last_name=data.get("last_name", ""),
+                )
+                mark_phone_verified(user)
+        except IntegrityError as exc:  # concurrent registration of the same phone
+            raise ConflictError("This phone is already registered.", code="phone_registered") from exc
         return _token_response(user, status.HTTP_201_CREATED)
 
 
@@ -107,10 +129,9 @@ class PasswordResetView(AuthView):
         user = User.objects.filter(phone=data["phone"], is_active=True).first()
         if user is None:
             raise ServiceError("Invalid or expired code.", code="otp_invalid")
-        user.set_password(data["new_password"])
-        user.save(update_fields=["password"])
+        set_password_and_revoke_tokens(user, data["new_password"])
         mark_phone_verified(user)
-        return Response({"detail": "Password updated."})
+        return Response({"detail": "Password updated. Please log in again."})
 
 
 class LogoutView(APIView):
@@ -129,6 +150,8 @@ class LogoutView(APIView):
 
 
 class RefreshView(TokenRefreshView):
+    serializer_class = s.SafeTokenRefreshSerializer
+
     @extend_schema(tags=["auth"])
     def post(self, request, *args, **kwargs):
         return super().post(request, *args, **kwargs)
@@ -146,9 +169,9 @@ class ChangePasswordView(APIView):
     def post(self, request):
         ser = s.ChangePasswordSerializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
-        request.user.set_password(ser.validated_data["new_password"])
-        request.user.save(update_fields=["password"])
-        return Response({"detail": "Password changed."})
+        set_password_and_revoke_tokens(request.user, ser.validated_data["new_password"])
+        # Old sessions are revoked; hand this client a fresh token pair.
+        return _token_response(request.user)
 
 
 class AddressViewSet(viewsets.ModelViewSet):

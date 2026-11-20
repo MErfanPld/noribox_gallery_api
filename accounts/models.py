@@ -54,6 +54,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     phone_verified_at = models.DateTimeField(null=True, blank=True)
+    token_version = models.PositiveIntegerField(
+        default=0, help_text="Embedded in JWTs ('tv'); bumped on password change/reset to revoke all tokens."
+    )
     date_joined = models.DateTimeField(default=timezone.now)
 
     objects = UserManager()

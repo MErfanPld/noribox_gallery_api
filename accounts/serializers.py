@@ -2,6 +2,8 @@ from django.contrib.auth import authenticate, password_validation
 from django.contrib.auth.models import Group
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from accounts.models import Address, OTPCode, User
@@ -23,7 +25,29 @@ class PhoneField(serializers.CharField):
 
 def tokens_for(user):
     refresh = RefreshToken.for_user(user)
+    refresh[TOKEN_VERSION_CLAIM] = user.token_version  # copied into the access token
     return {"access": str(refresh.access_token), "refresh": str(refresh)}
+
+
+TOKEN_VERSION_CLAIM = "tv"
+
+
+def token_is_revoked(token, user):
+    return int(token.get(TOKEN_VERSION_CLAIM, 0)) != user.token_version
+
+
+class SafeTokenRefreshSerializer(TokenRefreshSerializer):
+    """Also rejects refresh tokens issued before the user's last password change."""
+
+    def validate(self, attrs):
+        try:
+            token = RefreshToken(attrs["refresh"])
+        except TokenError as exc:
+            raise InvalidToken(str(exc)) from exc
+        user = User.objects.filter(pk=token.get("user_id"), is_active=True).first()
+        if user is None or token_is_revoked(token, user):
+            raise InvalidToken("Token has been revoked.")
+        return super().validate(attrs)
 
 
 class TokenPairSerializer(serializers.Serializer):

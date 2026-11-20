@@ -6,8 +6,13 @@ import sys
 
 def main():
     """Run administrative tasks."""
-    default = 'config.settings.test' if len(sys.argv) > 1 and sys.argv[1] == 'test' else 'config.settings.dev'
-    os.environ.setdefault('DJANGO_SETTINGS_MODULE', default)
+    if len(sys.argv) > 1 and sys.argv[1] == 'test':
+        # Tests always run with test settings, whatever .env/environment says.
+        os.environ['DJANGO_SETTINGS_MODULE'] = 'config.settings.test'
+    else:
+        # Load .env BEFORE choosing settings so DJANGO_SETTINGS_MODULE in .env is honoured.
+        import config.env  # noqa: F401
+        os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings.dev')
     try:
         from django.core.management import execute_from_command_line
     except ImportError as exc:

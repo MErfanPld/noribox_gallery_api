@@ -86,12 +86,37 @@ def mark_phone_verified(user):
         user.save(update_fields=["phone_verified_at"])
 
 
+def revoke_all_tokens(user):
+    """Blacklist every outstanding refresh token and invalidate issued access tokens."""
+    from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+
+    from django.db.models import F
+
+    type(user).objects.filter(pk=user.pk).update(token_version=F("token_version") + 1)
+    user.refresh_from_db(fields=["token_version"])
+    for token in OutstandingToken.objects.filter(user=user, blacklistedtoken__isnull=True):
+        BlacklistedToken.objects.get_or_create(token=token)
+
+
+@transaction.atomic
+def set_password_and_revoke_tokens(user, raw_password):
+    user.set_password(raw_password)
+    user.save(update_fields=["password"])
+    revoke_all_tokens(user)
+
+
 def get_or_create_otp_user(phone):
+    from django.db import IntegrityError
+
     user = User.objects.filter(phone=phone).first()
     if user is None:
         if not settings.OTP_LOGIN_AUTO_REGISTER:
             raise ServiceError("Invalid or expired code.", code="otp_invalid")
-        user = User.objects.create_user(phone=phone)
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(phone=phone)
+        except IntegrityError:  # concurrent first login
+            user = User.objects.get(phone=phone)
     if not user.is_active:
         raise ServiceError("Account disabled.", code="account_disabled", status_code=403)
     mark_phone_verified(user)

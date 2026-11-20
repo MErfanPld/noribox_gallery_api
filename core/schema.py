@@ -16,3 +16,12 @@ class NoriboxAutoSchema(AutoSchema):
     def get_operation_id(self):
         op = super().get_operation_id()
         return f"admin_{op}" if self._is_admin() else op
+
+
+def public_endpoints(endpoints, **kwargs):
+    """Preprocessing hook: storefront schema excludes the management API."""
+    return [e for e in endpoints if not e[0].startswith("/api/admin/")]
+
+
+def admin_endpoints(endpoints, **kwargs):
+    return [e for e in endpoints if e[0].startswith("/api/admin/")]

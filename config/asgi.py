@@ -11,6 +11,8 @@ import os
 
 from django.core.asgi import get_asgi_application
 
+import config.env  # noqa: E402,F401  (load .env before choosing settings)
+
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings.prod')
 
 application = get_asgi_application()

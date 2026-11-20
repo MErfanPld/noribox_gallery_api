@@ -84,7 +84,12 @@ class OTPTests(TestCase):
         self.assertEqual(ok.status_code, 200)
         bad = self.c.post("/api/v1/auth/login/", {"phone": "09351234567", "password": "nope"})
         self.assertEqual(bad.status_code, 400)
-        self.assertEqual(self.request("09351234567", "register").status_code, 400)  # already registered
+        # Already registered: identical 202 response (no enumeration) and no SMS sent.
+        OTPCode.objects.all().delete()
+        before = len(self.sms.outbox)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.assertEqual(self.request("09351234567", "register").status_code, 202)
+        self.assertEqual(len(self.sms.outbox), before)
 
     def test_password_reset(self):
         make_user("09125550000")
