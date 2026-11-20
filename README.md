@@ -50,8 +50,8 @@ reservation per variant.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set POSTGRES_PASSWORD, DJANGO_SECRET_KEY …
+pip install -r requirements.txt -c constraints.txt
+cp .env.example .env            # set POSTGRES_PASSWORD, DJANGO_SECRET_KEY, REDIS_URL …
 createdb noribox                # or use DB_ENGINE=sqlite for a quick try
 python manage.py migrate
 python manage.py setup_roles    # RBAC groups
@@ -61,8 +61,11 @@ python manage.py runserver
 python manage.py test           # uses config.settings.test automatically
 ```
 
-`manage.py` defaults to `config.settings.dev` (and `config.settings.test` for
-`manage.py test`); `wsgi.py`/`asgi.py` default to `config.settings.prod`.
+Settings selection: `.env` is loaded first, then `DJANGO_SETTINGS_MODULE` decides.
+Without it, `manage.py` uses `config.settings.dev` and `wsgi.py`/`asgi.py` use
+`config.settings.prod`; `manage.py test` always uses `config.settings.test`.
+On production hosts set `DJANGO_SETTINGS_MODULE=config.settings.prod` **and**
+`DJANGO_ENV=production` (dev settings then refuse to boot).
 All variables are documented in [`.env.example`](.env.example).
 
 ## Roles (RBAC)
@@ -90,43 +93,88 @@ python manage.py import_source_products --fixture products/fixtures/mehrdadgalle
 python manage.py import_source_products --url https://mehrdadgallery.com/shop/ --limit 50
 ```
 
-Each run creates an `ImportJob` with per-item actions (`created`, `updated`,
-`unchanged`, `would_create`, `duplicate`, `error`…) and field-level diffs.
-Admins then review `SourceProduct`s via `/api/admin/imports/source-products/`
-and either `create-draft` (always a **draft** product), `link-variant`, or `ignore`.
-Products without a WooCommerce ID (e.g. out-of-stock cards) are keyed by a
-deterministic permalink hash (`url:…`).
+The admin API (`POST /api/admin/imports/jobs/`) only **queues** a job (HTTP 202);
+`manage.py process_import_jobs` executes queued jobs outside the request cycle.
+Jobs are claimed atomically (no double execution), send heartbeats, and a job
+whose worker died is re-queued (up to `IMPORT_MAX_ATTEMPTS`) or failed by
+`run_scheduled_jobs`. Failed jobs can be re-queued with `POST …/jobs/{id}/retry/`.
 
-## Scheduled jobs
+All outbound fetches (listing pages, pagination links, scraped image URLs) go
+through `core/http.py`: http/https only, ports 80/443, every resolved address
+must be public, the connection is pinned to the vetted IP (no DNS rebinding),
+every redirect is re-validated, and responses are size-capped. Pagination never
+leaves the starting host.
 
-There is no Celery dependency; run one idempotent command from cron/systemd every 5 minutes:
+Each run records per-item actions (`created`, `updated`, `unchanged`,
+`would_create`, `duplicate`, `error`…) and field-level diffs. Admins review
+`SourceProduct`s via `/api/admin/imports/source-products/` and either
+`create-draft` (always a **draft** product), `link-variant`, or `ignore`.
+Source prices only ever update `source_price`, never `price`.
+
+## Scheduled jobs (cron)
+
+No Celery: two idempotent commands, each protected against overlapping runs
+(PostgreSQL advisory lock):
 
 ```cron
-*/5 * * * * cd /srv/noribox && .venv/bin/python manage.py run_scheduled_jobs >> /var/log/noribox/jobs.log 2>&1
+DJANGO_SETTINGS_MODULE=config.settings.prod
+DJANGO_ENV=production
+* * * * * cd /srv/noribox && .venv/bin/python manage.py run_scheduled_jobs >> /var/log/noribox/jobs.log 2>&1
+* * * * * cd /srv/noribox && .venv/bin/python manage.py process_import_jobs >> /var/log/noribox/imports.log 2>&1
 ```
 
-It (1) expires reservations older than `RESERVATION_TTL_HOURS` (released and the
-order flagged for review), (2) cancels orders unpaid for `UNPAID_ORDER_TTL_HOURS`,
-(3) retries failed SMS with exponential backoff up to `SMS_MAX_ATTEMPTS`.
-Use `--only reservations|orders|sms` to run one task.
+`run_scheduled_jobs` (use `--only receipts|reservations|orders|sms|imports`):
+1. re-attempts reservations for receipts left `not_attempted` (e.g. a crash after upload);
+2. expires reservations older than `RESERVATION_TTL_HOURS` (orders still under review are flagged);
+3. cancels orders still `awaiting_payment` after `UNPAID_ORDER_TTL_HOURS` — each order is locked
+   and re-checked, so an order with an uploaded receipt is never cancelled;
+4. sends queued notification SMS and retries failures with exponential backoff;
+5. recovers stale import jobs.
 
 ## Deployment
 
-1. Provision PostgreSQL 14+ and Python 3.12+.
-2. Set environment variables (`DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS`,
-   `POSTGRES_*`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`, SMS keys). Prod
-   settings refuse to start with the default secret key.
-3. `pip install -r requirements.txt`
-4. `python manage.py migrate && python manage.py setup_roles && python manage.py seed_defaults && python manage.py collectstatic --noinput`
-5. Run `gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 3` behind nginx (TLS terminated at nginx, which must send `X-Forwarded-Proto`).
-6. nginx: serve `/static/` from `STATIC_ROOT` and `/media/` from `MEDIA_ROOT`. **Never** expose `PRIVATE_MEDIA_ROOT` — receipts are streamed only by the permission-checked endpoints. Set `client_max_body_size 10m`.
-7. Install the cron entry above. Back up the database and both media directories.
+1. PostgreSQL 14+, Redis 6+, Python 3.12+ (tested on 3.13).
+2. Environment (see `.env.example`). Production settings refuse to start unless
+   `DJANGO_SECRET_KEY` (≥ 32 chars), `DJANGO_ALLOWED_HOSTS` (no `*`), `POSTGRES_PASSWORD`
+   and `REDIS_URL` are set. Also set `DJANGO_SETTINGS_MODULE=config.settings.prod`,
+   `DJANGO_ENV=production`, `TRUSTED_PROXIES`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`, SMS keys.
+3. Install and prepare (with the production variables exported):
+   ```bash
+   pip install -r requirements.txt -c constraints.txt
+   export DJANGO_SETTINGS_MODULE=config.settings.prod DJANGO_ENV=production
+   python manage.py check --deploy
+   python manage.py migrate
+   python manage.py setup_roles
+   python manage.py seed_defaults
+   python manage.py collectstatic --noinput
+   python manage.py createsuperuser
+   ```
+4. Run `gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 3 --timeout 60` behind Nginx.
+5. Nginx: use [`deploy/nginx.conf`](deploy/nginx.conf). It **overwrites** `X-Real-IP` and
+   `X-Forwarded-For` with `$remote_addr`; set `TRUSTED_PROXIES` to the address Nginx connects
+   from (`127.0.0.1/32` on one host). Without a trusted proxy entry the app ignores forwarded
+   headers entirely, so clients cannot spoof their IP to evade throttling. **Never** serve
+   `PRIVATE_MEDIA_ROOT`.
+6. Install the two cron entries above. Back up the database and both media directories.
+
+### Receipt files
+
+Receipts are never public. `file_url` in receipt payloads points to
+`/api/v1/receipts/{id}/file/` (owner) or `/api/admin/receipts/{id}/file/` (staff with
+`payments.view_paymentreceipt`); both need `Authorization: Bearer …`, so the frontend must
+`fetch()` the file and display it via a blob/object URL (a plain `<img src>` cannot send the token).
+
+### API documentation access
+
+`/api/schema/` + `/api/docs/` describe the storefront API and are public.
+`/api/admin/schema/` + `/api/admin/docs/` describe the management API and require a staff
+user (JWT, or a Django-admin session for the browsable UI).
 
 ### Migrating from the prototype
 
 Migration `products.0003` renames the prototype `products.Product` table to
-`SourceProduct` (data preserved). The project now uses a custom user model
-(`accounts.User`, phone-based). A database created by the prototype (which used
-`auth.User`) cannot switch user models in place: create a fresh database,
-run `migrate`, and re-run `import_source_products` (source data is fully
-re-importable). No production database existed for the prototype.
+`SourceProduct` (data preserved; covered by a migration test). The project uses a
+custom user model (`accounts.User`, phone-based). A database created by the
+prototype (which used `auth.User`) cannot switch user models in place: create a
+fresh database, run `migrate`, and re-run `import_source_products` (source data
+is fully re-importable). No production database existed for the prototype.

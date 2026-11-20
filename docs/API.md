@@ -1,6 +1,6 @@
 # Noribox Gallery API reference
 
-Full machine-readable contract: `GET /api/schema/` (OpenAPI 3), browsable at `/api/docs/`.
+Machine-readable contracts: storefront `GET /api/schema/` (public, UI at `/api/docs/`); management `GET /api/admin/schema/` (staff only, UI at `/api/admin/docs/`).
 This page summarises endpoints, permissions and example payloads.
 
 ## Conventions
@@ -14,7 +14,8 @@ This page summarises endpoints, permissions and example payloads.
   {"error": {"code": "reservation_conflict", "message": "…", "details": {"unavailable_variant_ids": [12]}}}
   ```
   Validation errors use `code: "validation_error"` with field errors in `details`.
-  Throttled responses (429) include `details.retry_after_seconds`.
+  Throttled responses (429) include `details.retry_after_seconds`. Repeated failed password logins for one phone return 429 `login_locked`.
+* **Multipart booleans**: in `multipart/form-data` requests an omitted boolean is read as `false` (HTML form semantics) — send `is_active=true` explicitly.
 
 ## Storefront `/api/v1/`
 
@@ -29,6 +30,8 @@ This page summarises endpoints, permissions and example payloads.
 | POST | `auth/password/reset/` | `{phone, code, new_password}` | Needs a `reset_password` OTP |
 | POST | `auth/token/refresh/` | `{refresh}` | |
 | POST | `auth/logout/` | `{refresh}` | Auth required; blacklists the refresh token |
+
+Password change (`account/password/`) and reset revoke **all** existing access and refresh tokens; the change endpoint returns a fresh token pair. `otp/request` always answers 202 with the same body (no account enumeration).
 
 Token response:
 ```json
@@ -84,7 +87,7 @@ Product detail (abridged):
 | GET | `orders/`, `orders/{number}/` | detail includes items, shipment, payment + receipts, history |
 | POST | `orders/{number}/cancel/` | only while `awaiting_payment` |
 | POST | `orders/{number}/receipts/` | multipart: `file` (jpg/png/webp/pdf ≤ 5 MB, signature checked), `reference_number?`, `payer_card_last4?`, `paid_at?`, `declared_amount?`, `customer_note?` |
-| GET | `receipts/{id}/file/` | streams the owner's receipt (`Cache-Control: private, no-store`) |
+| GET | `receipts/{id}/file/` | streams the owner's receipt (`Cache-Control: private, no-store`). Requires the Bearer token — fetch it and render via a blob URL |
 
 Order status flow:
 `awaiting_payment → payment_submitted (receipt) → paid (approved) → processing → shipped → delivered`;
@@ -109,9 +112,9 @@ Receipt response:
 | Users & roles | `users/`, `roles/` | role/staff changes need `accounts.manage_roles` |
 | Catalog | `categories/`, `brands/`, `attributes/`, `attribute-options/`, `category-attributes/`, `products/`, `variants/`, `product-images/` (multipart) | `products/{id}/publish/`, `unpublish/`, `archive/` (`catalog.publish_product`) |
 | Inventory | `inventory/availability/`, `inventory/reservations/` | `availability/{id}/set-state/` `{state: available\|unavailable, note}`, `reservations/{id}/release/` (`inventory.manage_inventory`) |
-| Imports | `imports/jobs/` (POST runs a job: `source_url` or multipart `html_file`, `limit`, `dry_run` default true — `products.run_import`), `imports/items/`, `imports/errors/`, `imports/source-products/`, `imports/source-categories/` (map `mapped_category`) | `source-products/{id}/create-draft/` `{price?, sku?, name?, label?, category?, brand?, download_images?}`, `link-variant/` `{variant}`, `ignore/` (`products.review_sourceproduct`) |
-| Orders | `orders/` (`?needs_review=true`, `?status=`) | `orders/{id}/transition/` `{status, note}`, `clear-review/` (`commerce.manage_order_status`) |
-| Payments | `payments/`, `receipts/`, `receipts/{id}/file/`, `payment-methods/`, `bank-cards/` | `receipts/{id}/approve/` `{reason?}`, `receipts/{id}/reject/` `{reason}` (`payments.review_payment`) |
+| Imports | `imports/jobs/` (POST **queues** a job → 202 `pending`: `source_url` (public http/https only) or multipart `html_file`, `limit`, `dry_run` default true — `products.run_import`; `jobs/{id}/retry/` re-queues a failed job), `imports/items/`, `imports/errors/`, `imports/source-products/`, `imports/source-categories/` (map `mapped_category`) | `source-products/{id}/create-draft/` `{price?, sku?, name?, label?, category?, brand?, download_images?}`, `link-variant/` `{variant}`, `ignore/` (`products.review_sourceproduct`) |
+| Orders | `orders/` (`?needs_review=true`, `?status=`) | `orders/{id}/transition/` `{status, note}`, `clear-review/` (`commerce.manage_order_status`); `record-refund/` `{reference, note?}` (`commerce.record_refund`) for cancelled paid orders (`refund_status: pending → refunded`) |
+| Payments | `payments/`, `receipts/`, `receipts/{id}/file/`, `payment-methods/`, `bank-cards/` | `receipts/{id}/approve/` `{reason?}`, `receipts/{id}/reject/` `{reason}`, `receipts/{id}/retry-reservation/` (`payments.review_payment`) |
 | Shipping | `shipping-methods/`, `shipments/` (tracking fields; status via order transitions) | |
 | Notifications | `notifications/sms-templates/` (+ `defaults/`), `notifications/sms-logs/` | `sms-logs/{id}/retry/` (`notifications.retry_sms`) |
 | CMS | `cms/pages/`, `cms/blog-categories/`, `cms/blog-posts/`, `cms/faqs/`, `cms/banners/`, `cms/sliders/`, `cms/slides/`, `cms/seo/`, `store-settings/` (GET/PATCH) | |
@@ -131,3 +134,13 @@ Default bodies (override per code in `sms-templates`; set `is_active=false` to d
 `order_status_processing`, `order_status_shipped`, `order_status_delivered`, `order_status_cancelled`.
 Placeholders: `{code}`, `{order_number}`, `{amount}`, `{reason}`, `{tracking_code}`, `{conflict}`.
 OTP messages are never stored in plaintext in `SMSLog` and are not retried.
+
+## Conflict codes (HTTP 409)
+
+| code | meaning |
+|---|---|
+| `reservation_conflict` | another order holds/sold a unit; resolve inventory or reject the payment |
+| `admin_marked_unavailable` | an administrator marked a reserved unit unavailable; approval would sell it, so it is refused |
+| `protected` | delete refused because orders/reservations/children reference the object; `details.referenced_by`, use archive/deactivate |
+| `invalid_transition`, `invalid_order_state`, `receipt_pending`, `receipt_not_pending` | state-machine guards |
+| `phone_registered` | concurrent/duplicate registration |
