@@ -13,11 +13,12 @@ unless an explicit numeric quantity is present in the source HTML.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 from bs4 import BeautifulSoup
 
@@ -123,6 +124,12 @@ def detect_availability(text: str) -> str:
     return "unknown"
 
 
+def permalink_key(url: str) -> str:
+    """Deterministic identity for cards that expose no WooCommerce ID."""
+    normalized = unquote(url).split("?")[0].split("#")[0].rstrip("/").lower()
+    return "url:" + hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:20]
+
+
 def _absolute_url(base: str, href: str | None) -> str | None:
     if not href:
         return None
@@ -194,8 +201,14 @@ def parse_listing_html(
                     pid = match.group(1)
                     break
 
-        # Do not create synthetic IDs from slugs.
-        if not pid or pid in seen_ids:
+        # Never invent numeric IDs. When the card exposes no WooCommerce ID
+        # (typical for out-of-stock cards without add-to-cart), fall back to a
+        # deterministic key derived from the canonical permalink.
+        id_source = "woocommerce_id"
+        if not pid:
+            pid = permalink_key(product_url)
+            id_source = "permalink"
+        if pid in seen_ids:
             continue
         seen_ids.add(pid)
 
@@ -254,6 +267,7 @@ def parse_listing_html(
                 raw_data={
                     "card_text_snippet": card_text[:300],
                     "source": "woocommerce_product_card",
+                    "id_source": id_source,
                 },
             )
         )

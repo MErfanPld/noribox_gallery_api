@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from django.test import TestCase
 
-from products.models import Product
+from products.models import SourceProduct as Product
 from products.services.importer import (
     SourceUnavailableError,
     import_products,

@@ -1,0 +1,198 @@
+from django.contrib.auth.models import Group
+from django.db import transaction
+from drf_spectacular.utils import extend_schema
+from rest_framework import generics, mixins, permissions, status, viewsets
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenRefreshView
+
+from accounts import serializers as s
+from accounts.models import Address, OTPCode, User
+from accounts.services import get_or_create_otp_user, mark_phone_verified, request_otp, verify_otp
+from core.exceptions import ServiceError
+from core.permissions import AdminModelPermission
+
+
+def _token_response(user, http_status=status.HTTP_200_OK):
+    data = s.tokens_for(user)
+    data["user"] = s.UserSerializer(user).data
+    return Response(data, status=http_status)
+
+
+class AuthView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_scope = "auth"
+
+    def get_throttles(self):
+        from rest_framework.throttling import ScopedRateThrottle
+
+        return [ScopedRateThrottle(), *super().get_throttles()]
+
+
+class OTPRequestView(AuthView):
+    throttle_scope = "otp_request"
+
+    @extend_schema(tags=["auth"], request=s.OTPRequestSerializer, responses={202: dict})
+    def post(self, request):
+        ser = s.OTPRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        phone, purpose = ser.validated_data["phone"], ser.validated_data["purpose"]
+        exists = User.objects.filter(phone=phone).exists()
+        if purpose == OTPCode.Purpose.REGISTER and exists:
+            raise ServiceError("This phone is already registered.", code="phone_registered")
+        # For password reset, respond identically whether or not the account exists.
+        if not (purpose == OTPCode.Purpose.RESET_PASSWORD and not exists):
+            request_otp(phone, purpose, ip_address=request.META.get("REMOTE_ADDR"))
+        from django.conf import settings
+
+        return Response(
+            {"detail": "If the number is valid, a code has been sent.", "expires_in": settings.OTP_TTL_SECONDS},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class OTPLoginView(AuthView):
+    throttle_scope = "otp_verify"
+
+    @extend_schema(tags=["auth"], request=s.OTPLoginSerializer, responses={200: s.TokenPairSerializer})
+    def post(self, request):
+        ser = s.OTPLoginSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        phone = ser.validated_data["phone"]
+        verify_otp(phone, OTPCode.Purpose.LOGIN, ser.validated_data["code"])
+        return _token_response(get_or_create_otp_user(phone))
+
+
+class PasswordLoginView(AuthView):
+    @extend_schema(tags=["auth"], request=s.PasswordLoginSerializer, responses={200: s.TokenPairSerializer})
+    def post(self, request):
+        ser = s.PasswordLoginSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        return _token_response(ser.validated_data["user"])
+
+
+class RegisterView(AuthView):
+    throttle_scope = "otp_verify"
+
+    @extend_schema(tags=["auth"], request=s.RegisterSerializer, responses={201: s.TokenPairSerializer})
+    def post(self, request):
+        ser = s.RegisterSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        if User.objects.filter(phone=data["phone"]).exists():
+            raise ServiceError("This phone is already registered.", code="phone_registered")
+        verify_otp(data["phone"], OTPCode.Purpose.REGISTER, data["code"])
+        with transaction.atomic():
+            user = User.objects.create_user(
+                phone=data["phone"],
+                password=data["password"],
+                first_name=data.get("first_name", ""),
+                last_name=data.get("last_name", ""),
+            )
+            mark_phone_verified(user)
+        return _token_response(user, status.HTTP_201_CREATED)
+
+
+class PasswordResetView(AuthView):
+    throttle_scope = "otp_verify"
+
+    @extend_schema(tags=["auth"], request=s.PasswordResetSerializer, responses={200: dict})
+    def post(self, request):
+        ser = s.PasswordResetSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        verify_otp(data["phone"], OTPCode.Purpose.RESET_PASSWORD, data["code"])
+        user = User.objects.filter(phone=data["phone"], is_active=True).first()
+        if user is None:
+            raise ServiceError("Invalid or expired code.", code="otp_invalid")
+        user.set_password(data["new_password"])
+        user.save(update_fields=["password"])
+        mark_phone_verified(user)
+        return Response({"detail": "Password updated."})
+
+
+class LogoutView(APIView):
+    @extend_schema(tags=["auth"], request=s.LogoutSerializer, responses={205: None})
+    def post(self, request):
+        ser = s.LogoutSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            token = RefreshToken(ser.validated_data["refresh"])
+            if str(token.get("user_id")) != str(request.user.pk):
+                raise ServiceError("Token does not belong to this user.", code="token_invalid")
+            token.blacklist()
+        except TokenError as exc:
+            raise ServiceError("Invalid token.", code="token_invalid") from exc
+        return Response(status=status.HTTP_205_RESET_CONTENT)
+
+
+class RefreshView(TokenRefreshView):
+    @extend_schema(tags=["auth"])
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
+
+class MeView(generics.RetrieveUpdateAPIView):
+    serializer_class = s.UserSerializer
+
+    def get_object(self):
+        return self.request.user
+
+
+class ChangePasswordView(APIView):
+    @extend_schema(tags=["account"], request=s.ChangePasswordSerializer, responses={200: dict})
+    def post(self, request):
+        ser = s.ChangePasswordSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        request.user.set_password(ser.validated_data["new_password"])
+        request.user.save(update_fields=["password"])
+        return Response({"detail": "Password changed."})
+
+
+class AddressViewSet(viewsets.ModelViewSet):
+    serializer_class = s.AddressSerializer
+    pagination_class = None
+    filter_backends = []
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return Address.objects.none()
+        return Address.objects.filter(user=self.request.user)
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        has_any = Address.objects.filter(user=self.request.user).exists()
+        is_default = serializer.validated_data.get("is_default") or not has_any
+        if is_default:
+            Address.objects.filter(user=self.request.user, is_default=True).update(is_default=False)
+        serializer.save(user=self.request.user, is_default=is_default)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        if serializer.validated_data.get("is_default"):
+            Address.objects.filter(user=self.request.user, is_default=True).exclude(
+                pk=serializer.instance.pk
+            ).update(is_default=False)
+        serializer.save()
+
+
+# --- admin -----------------------------------------------------------------
+class AdminUserViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, mixins.RetrieveModelMixin,
+                       mixins.UpdateModelMixin, viewsets.GenericViewSet):
+    queryset = User.objects.prefetch_related("groups").order_by("-date_joined")
+    permission_classes = [AdminModelPermission]
+    filterset_fields = ["is_active", "is_staff", "groups__name"]
+    search_fields = ["phone", "first_name", "last_name", "email"]
+    ordering_fields = ["date_joined", "last_login", "phone"]
+
+    def get_serializer_class(self):
+        return s.AdminUserCreateSerializer if self.action == "create" else s.AdminUserSerializer
+
+
+class AdminRoleViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Group.objects.prefetch_related("permissions").order_by("name")
+    serializer_class = s.GroupSerializer
+    permission_classes = [AdminModelPermission]
+    pagination_class = None

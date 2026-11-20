@@ -1,7 +1,7 @@
 from django.test import TestCase
 
 from categories.models import Category
-from products.models import Product
+from products.models import SourceProduct as Product
 
 
 class CategoryModelTests(TestCase):

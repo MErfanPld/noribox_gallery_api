@@ -1,6 +1,7 @@
 """
-Management command: import a small sample of products from Mehrdad Gallery
-or from a local HTML fixture when the remote source is unreachable.
+Management command: stage products from the configured source website or a
+local HTML fixture. Creates an ImportJob with per-item history. Products are
+staged as SourceProduct records only; nothing is published.
 """
 
 from pathlib import Path
@@ -8,119 +9,47 @@ from pathlib import Path
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
-from products.services.importer import (
-    SourceUnavailableError,
-    run_import_from_fixture,
-    run_import_from_url,
-)
+from products.models import ImportJob
+from products.services.importer import run_job
 
 
 class Command(BaseCommand):
-    help = (
-        "Import a limited sample of products from the configured source website "
-        "or from a local HTML fixture. Exact stock quantities are never invented."
-    )
+    help = "Stage source products (with ImportJob history). Never publishes catalog products."
 
     def add_arguments(self, parser):
-        parser.add_argument(
-            "--url",
-            default=None,
-            help="Source listing URL (default: shop page of SOURCE_BASE_URL)",
-        )
-        parser.add_argument(
-            "--fixture",
-            type=str,
-            default=None,
-            help="Path to a local HTML fixture file (used when live fetch is impossible)",
-        )
-        parser.add_argument(
-            "--limit",
-            type=int,
-            default=None,
-            help=f"Max products to import (default: {getattr(settings, 'IMPORT_DEFAULT_LIMIT', 5)})",
-        )
-        parser.add_argument(
-            "--source-site",
-            default=None,
-            help="Source site identifier stored on Product (default: SOURCE_SITE_ID)",
-        )
-        parser.add_argument(
-            "--dry-run",
-            action="store_true",
-            help="Parse only; do not write to the database",
-        )
+        parser.add_argument("--url", default=None, help="Source listing URL (default: SOURCE_BASE_URL/shop/)")
+        parser.add_argument("--fixture", default=None, help="Path to a local HTML fixture file")
+        parser.add_argument("--limit", type=int, default=None, help="Max products to import")
+        parser.add_argument("--source-site", default=None, help="Source site identifier (default: SOURCE_SITE_ID)")
+        parser.add_argument("--dry-run", action="store_true", help="Preview changes; do not write SourceProducts")
 
     def handle(self, *args, **options):
-        limit = options["limit"]
-        if limit is None:
-            limit = getattr(settings, "IMPORT_DEFAULT_LIMIT", 5)
-        source_site = options["source_site"] or getattr(
-            settings, "SOURCE_SITE_ID", "mehrdadgallery"
-        )
-        fixture = options["fixture"]
-        url = options["url"]
-        dry_run = options["dry_run"]
-
-        if fixture:
-            path = Path(fixture)
+        limit = options["limit"] if options["limit"] is not None else getattr(settings, "IMPORT_DEFAULT_LIMIT", None)
+        source_site = options["source_site"] or settings.SOURCE_SITE_ID
+        job = ImportJob(source_site=source_site, limit=limit, dry_run=options["dry_run"])
+        if options["fixture"]:
+            path = Path(options["fixture"])
             if not path.is_file():
                 raise CommandError(f"Fixture file not found: {path}")
             self.stdout.write(self.style.WARNING(f"Using local fixture: {path}"))
-            if dry_run:
-                from products.services.importer import load_fixture
-                from products.services.parser import parse_listing_html
-
-                html = load_fixture(path)
-                products = parse_listing_html(
-                    html, base_url=getattr(settings, "SOURCE_BASE_URL", "https://mehrdadgallery.com")
-                )
-                self.stdout.write(f"Parsed {len(products)} product(s) (dry-run, limit={limit}):")
-                for p in products[:limit]:
-                    self.stdout.write(
-                        f"  - id={p.source_product_id} name={p.name[:50]!r} "
-                        f"avail={p.availability} reg={p.regular_price} sale={p.sale_price}"
-                    )
-                return
-
-            stats = run_import_from_fixture(
-                path, source_site=source_site, limit=limit
-            )
+            job.source_type, job.fixture_path = ImportJob.SourceType.FIXTURE, str(path)
         else:
-            if not url:
-                base = getattr(settings, "SOURCE_BASE_URL", "https://mehrdadgallery.com")
-                url = f"{base.rstrip('/')}/shop/"
+            url = options["url"] or f"{settings.SOURCE_BASE_URL.rstrip('/')}/shop/"
             self.stdout.write(f"Fetching: {url}")
-            try:
-                if dry_run:
-                    from products.services.importer import fetch_html
-                    from products.services.parser import parse_listing_html
-
-                    html = fetch_html(url)
-                    products = parse_listing_html(
-                        html,
-                        base_url=getattr(settings, "SOURCE_BASE_URL", "https://mehrdadgallery.com"),
-                    )
-                    self.stdout.write(f"Parsed {len(products)} product(s) (dry-run, limit={limit}):")
-                    for p in products[:limit]:
-                        self.stdout.write(
-                            f"  - id={p.source_product_id} name={p.name[:50]!r} "
-                            f"avail={p.availability} reg={p.regular_price} sale={p.sale_price}"
-                        )
-                    return
-
-                stats = run_import_from_url(url, source_site=source_site, limit=limit)
-            except SourceUnavailableError as exc:
-                raise CommandError(
-                    f"{exc}\n"
-                    "The remote source is unreachable from this environment. "
-                    "Re-run with --fixture path/to/listing.html to test the parser "
-                    "against a saved HTML sample."
-                ) from exc
-
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"Import finished: created={stats['created']} "
-                f"updated={stats['updated']} skipped={stats['skipped']} "
-                f"errors={stats['errors']}"
+            job.source_type, job.source_url = ImportJob.SourceType.URL, url
+        job.save()
+        job = run_job(job)
+        if job.status == ImportJob.Status.FAILED:
+            raise CommandError(
+                f"Import job #{job.pk} failed: {job.log}\nIf the source is unreachable, re-run with "
+                "--fixture path/to/listing.html to test the parser against a saved HTML sample."
             )
-        )
+        if job.dry_run:
+            for item in job.items.all():
+                self.stdout.write(f"  - [{item.action}] id={item.external_id} name={item.name[:50]!r} {item.changes or ''}")
+        s = job.stats
+        self.stdout.write(self.style.SUCCESS(
+            f"Import job #{job.pk} {'(dry-run) ' if job.dry_run else ''}finished: created={s.get('created', 0)} "
+            f"updated={s.get('updated', 0)} unchanged={s.get('unchanged', 0)} skipped={s.get('skipped', 0)} "
+            f"duplicates={s.get('duplicates', 0)} errors={s.get('errors', 0)}"
+        ))

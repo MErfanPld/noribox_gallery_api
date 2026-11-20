@@ -3,7 +3,10 @@ from django.utils.text import slugify
 
 
 class Category(models.Model):
-    """Category imported from the external WooCommerce source."""
+    """Category observed at an external import source (staging only).
+
+    Storefront categories are ``catalog.Category`` and are managed by admins.
+    """
 
     source_site = models.CharField(max_length=64, db_index=True, default="mehrdadgallery")
     source_category_id = models.CharField(
@@ -25,6 +28,14 @@ class Category(models.Model):
         related_name="children",
     )
     description = models.TextField(blank=True, default="")
+    mapped_category = models.ForeignKey(
+        "catalog.Category",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="source_categories",
+        help_text="Internal catalog category this source category maps to (admin-managed)",
+    )
     is_active = models.BooleanField(default=True)
     last_successful_sync_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

@@ -1,0 +1,133 @@
+# Noribox Gallery API reference
+
+Full machine-readable contract: `GET /api/schema/` (OpenAPI 3), browsable at `/api/docs/`.
+This page summarises endpoints, permissions and example payloads.
+
+## Conventions
+
+* **Auth**: `Authorization: Bearer <access>` (JWT). Access 30 min, refresh 14 days, refresh rotation + blacklist.
+* **Money**: integers in Toman.
+* **Phones**: any common Iranian format is accepted (`+98912…`, `0912…`, Persian digits) and normalised to `09XXXXXXXXX`.
+* **Pagination**: `?page=N&page_size=M` (max 100) → `{"count", "next", "previous", "results"}`.
+* **Errors** (always):
+  ```json
+  {"error": {"code": "reservation_conflict", "message": "…", "details": {"unavailable_variant_ids": [12]}}}
+  ```
+  Validation errors use `code: "validation_error"` with field errors in `details`.
+  Throttled responses (429) include `details.retry_after_seconds`.
+
+## Storefront `/api/v1/`
+
+### Auth (public, throttled)
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `auth/otp/request/` | `{phone, purpose: login\|register\|reset_password}` | 202. Cooldown + hourly limit per phone |
+| POST | `auth/otp/login/` | `{phone, code}` | Creates the account on first login (`OTP_LOGIN_AUTO_REGISTER`) |
+| POST | `auth/register/` | `{phone, code, password, first_name?, last_name?}` | Needs a `register` OTP |
+| POST | `auth/login/` | `{phone, password}` | |
+| POST | `auth/password/reset/` | `{phone, code, new_password}` | Needs a `reset_password` OTP |
+| POST | `auth/token/refresh/` | `{refresh}` | |
+| POST | `auth/logout/` | `{refresh}` | Auth required; blacklists the refresh token |
+
+Token response:
+```json
+{"access": "eyJ…", "refresh": "eyJ…",
+ "user": {"id": 1, "phone": "09121234567", "first_name": "", "last_name": "", "email": "",
+          "national_code": "", "phone_verified_at": "2026-11-20T10:00:00Z", "date_joined": "…",
+          "is_staff": false, "has_password": false}}
+```
+
+### Account (auth)
+
+`GET/PATCH account/me/` · `POST account/password/` `{current_password?, new_password}` ·
+`GET/POST account/addresses/`, `GET/PUT/PATCH/DELETE account/addresses/{id}/`
+
+```json
+{"title": "Home", "recipient_name": "Ali Rezaei", "recipient_phone": "09121112233",
+ "province": "Tehran", "city": "Tehran", "address_line": "Valiasr St.", "postal_code": "1234567890",
+ "plaque": "12", "unit": "3", "is_default": true}
+```
+
+### Catalog (public)
+
+| Path | Notes |
+|---|---|
+| `categories/`, `categories/tree/`, `categories/{slug}/`, `categories/{slug}/attributes/` | active categories, nested tree, filterable attributes |
+| `brands/`, `brands/{slug}/` | |
+| `products/` | published only. Filters: `category` (slug, includes subcategories), `brand` (slugs, comma), `min_price`, `max_price`, `available`, `featured`, `options=gender:male,volume:100ml`, `q`. Sort: `sort=newest\|oldest\|price_asc\|price_desc\|name\|featured` |
+| `products/{slug}/` | variants with availability, images, attributes, SEO |
+
+Product detail (abridged):
+```json
+{"id": 7, "name": "Sauvage EDP", "slug": "sauvage-edp", "brand": {"name": "Dior", "slug": "dior"},
+ "min_price": 5000000, "max_compare_at_price": 5500000, "is_available": true,
+ "variants": [{"id": 31, "sku": "DIOR-SAU-100", "label": "100ml", "options": [],
+               "price": 5000000, "compare_at_price": 5500000,
+               "availability": "available", "is_available": true, "condition_note": ""}],
+ "images": [{"id": 3, "image": "/media/products/2026/11/a.webp", "alt_text": "", "is_primary": true}],
+ "attributes": [{"attribute": "gender", "attribute_name": "Gender", "options": [{"value": "Male", "slug": "male"}]}],
+ "meta_title": "", "meta_description": ""}
+```
+
+### Cart (auth)
+
+`GET cart/` · `DELETE cart/` (clear) · `POST cart/items/` `{variant_id}` (201 new / 200 already present; quantity is always 1) · `DELETE cart/items/{id}/`
+
+### Orders & payment (auth, owner-scoped — other users' orders return 404)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `shipping-methods/` | public |
+| GET | `payment-methods/`, `bank-cards/` | public; store card/SHEBA numbers to transfer to |
+| POST | `orders/` | `{address_id, shipping_method_id, customer_note?}` → order from cart (no reservation) |
+| GET | `orders/`, `orders/{number}/` | detail includes items, shipment, payment + receipts, history |
+| POST | `orders/{number}/cancel/` | only while `awaiting_payment` |
+| POST | `orders/{number}/receipts/` | multipart: `file` (jpg/png/webp/pdf ≤ 5 MB, signature checked), `reference_number?`, `payer_card_last4?`, `paid_at?`, `declared_amount?`, `customer_note?` |
+| GET | `receipts/{id}/file/` | streams the owner's receipt (`Cache-Control: private, no-store`) |
+
+Order status flow:
+`awaiting_payment → payment_submitted (receipt) → paid (approved) → processing → shipped → delivered`;
+rejection returns to `awaiting_payment`; `cancelled` is reachable before shipping.
+
+Receipt response:
+```json
+{"id": 4, "status": "pending", "original_filename": "receipt.jpg", "content_type": "image/jpeg", "size": 81234,
+ "reference_number": "123456", "payer_card_last4": "1234", "paid_at": null, "declared_amount": 4150000,
+ "customer_note": "", "file_url": "/api/v1/receipts/4/file/", "reviews": [], "created_at": "…"}
+```
+
+### CMS (public)
+
+`pages/{slug}/` · `blog/categories/` · `blog/posts/` (`?category__slug=`, `?search=`) · `blog/posts/{slug}/` ·
+`faqs/` (`?group=`) · `banners/` (`?position=home_top`) · `sliders/{code}/` · `store-settings/` · `seo/?path=/brands`
+
+## Management `/api/admin/` (staff + permission)
+
+| Area | Endpoints | Extra actions (permission) |
+|---|---|---|
+| Users & roles | `users/`, `roles/` | role/staff changes need `accounts.manage_roles` |
+| Catalog | `categories/`, `brands/`, `attributes/`, `attribute-options/`, `category-attributes/`, `products/`, `variants/`, `product-images/` (multipart) | `products/{id}/publish/`, `unpublish/`, `archive/` (`catalog.publish_product`) |
+| Inventory | `inventory/availability/`, `inventory/reservations/` | `availability/{id}/set-state/` `{state: available\|unavailable, note}`, `reservations/{id}/release/` (`inventory.manage_inventory`) |
+| Imports | `imports/jobs/` (POST runs a job: `source_url` or multipart `html_file`, `limit`, `dry_run` default true — `products.run_import`), `imports/items/`, `imports/errors/`, `imports/source-products/`, `imports/source-categories/` (map `mapped_category`) | `source-products/{id}/create-draft/` `{price?, sku?, name?, label?, category?, brand?, download_images?}`, `link-variant/` `{variant}`, `ignore/` (`products.review_sourceproduct`) |
+| Orders | `orders/` (`?needs_review=true`, `?status=`) | `orders/{id}/transition/` `{status, note}`, `clear-review/` (`commerce.manage_order_status`) |
+| Payments | `payments/`, `receipts/`, `receipts/{id}/file/`, `payment-methods/`, `bank-cards/` | `receipts/{id}/approve/` `{reason?}`, `receipts/{id}/reject/` `{reason}` (`payments.review_payment`) |
+| Shipping | `shipping-methods/`, `shipments/` (tracking fields; status via order transitions) | |
+| Notifications | `notifications/sms-templates/` (+ `defaults/`), `notifications/sms-logs/` | `sms-logs/{id}/retry/` (`notifications.retry_sms`) |
+| CMS | `cms/pages/`, `cms/blog-categories/`, `cms/blog-posts/`, `cms/faqs/`, `cms/banners/`, `cms/sliders/`, `cms/slides/`, `cms/seo/`, `store-settings/` (GET/PATCH) | |
+| Reports | `reports/summary/?days=30` | revenue, orders by status, review queue, inventory states, daily series |
+
+Approve conflict example (HTTP 409):
+```json
+{"error": {"code": "reservation_conflict",
+           "message": "Cannot approve: some items could not be reserved. Resolve inventory or reject the payment.",
+           "details": {"unavailable_variant_ids": [31]}}}
+```
+
+## SMS templates
+
+Default bodies (override per code in `sms-templates`; set `is_active=false` to disable an event):
+`otp`, `receipt_uploaded_admin`, `payment_approved`, `payment_rejected`,
+`order_status_processing`, `order_status_shipped`, `order_status_delivered`, `order_status_cancelled`.
+Placeholders: `{code}`, `{order_number}`, `{amount}`, `{reason}`, `{tracking_code}`, `{conflict}`.
+OTP messages are never stored in plaintext in `SMSLog` and are not retried.

@@ -36,3 +36,5 @@ secrets/
 # Project artifacts not for commit
 searched_images/
 *.html.bak
+
+private_media/
