@@ -98,7 +98,7 @@ class ImportFromFixtureTests(TestCase):
 
 
 class NetworkErrorTests(TestCase):
-    @patch("products.services.importer.urlopen")
+    @patch("products.services.importer.safe_fetch")
     def test_source_unavailable(self, mock_urlopen):
         from products.services.importer import fetch_html
 

@@ -1,6 +1,5 @@
 """Admin review of staged source products → catalog drafts (never auto-published)."""
 import logging
-from urllib.request import Request, urlopen
 
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -10,6 +9,7 @@ from django.utils import timezone
 from catalog.models import Product, ProductCategory, ProductImage, ProductVariant
 from core.exceptions import ConflictError, ServiceError
 from core.files import detect_kind
+from core.http import FetchError, UnsafeURLError, safe_fetch
 from core.utils import random_code
 from products.models import SourceProduct
 from products.services.importer import sync_linked_variant_source_price
@@ -28,17 +28,19 @@ def _generate_sku(source):
 
 
 def download_image(url, max_size=None):
-    """Download a remote image for local storage. Returns ContentFile or None."""
+    """Download a scraped image for local storage through the SSRF-safe client.
+
+    ``url`` comes from untrusted HTML; non-http(s), internal or oversized
+    targets are refused. Returns ContentFile or None.
+    """
     max_size = max_size or settings.PRODUCT_IMAGE_MAX_SIZE_BYTES
     try:
-        req = Request(url, headers={"User-Agent": settings.IMPORT_USER_AGENT})
-        with urlopen(req, timeout=settings.IMPORT_REQUEST_TIMEOUT) as resp:
-            data = resp.read(max_size + 1)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Image download failed %s: %s", url, exc)
+        data = safe_fetch(url, max_bytes=max_size, headers={"Accept": "image/*"}).body
+    except (UnsafeURLError, FetchError, OSError) as exc:
+        logger.warning("Image download refused/failed %s: %s", url, exc)
         return None
     kind = detect_kind(data[:16])
-    if len(data) > max_size or kind not in {"jpg", "jpeg", "png", "webp", "gif"}:
+    if kind not in {"jpg", "jpeg", "png", "webp", "gif"}:
         return None
     return ContentFile(data, name=f"import.{kind}")
 

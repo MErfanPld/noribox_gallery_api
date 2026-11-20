@@ -75,8 +75,11 @@ class ImportJobTests(TestCase):
         c = client_for(staff)
         with open(FIXTURE, "rb") as fh:
             res = c.post("/api/admin/imports/jobs/", {"html_file": fh, "dry_run": "false"}, format="multipart")
-        self.assertEqual(res.status_code, 201, res.data)
-        self.assertEqual(res.data["status"], "completed")
+        self.assertEqual(res.status_code, 202, res.data)
+        self.assertEqual(res.data["status"], "pending")  # queued, not run in the request
+        from products.services.importer import process_pending_jobs
+
+        self.assertEqual(process_pending_jobs(), [(res.data["id"], "completed")])
         sp = SourceProduct.objects.get(source_product_id="52474")
         res = c.post(f"/api/admin/imports/source-products/{sp.pk}/create-draft/", {"price": 4000000, "download_images": False})
         self.assertEqual(res.status_code, 201, res.data)

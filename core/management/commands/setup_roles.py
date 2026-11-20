@@ -28,6 +28,7 @@ ROLES = {
     ],
     "finance": [
         *perms("payments", ["payment", "paymentreceipt"], ["view"]), "payments.review_payment",
+        "commerce.record_refund",
         *perms("payments", ["paymentmethod", "storebankcard"]),
         *perms("commerce", ["order"], ["view"]),
         *perms("inventory", ["reservation"], ["view"]),

@@ -6,10 +6,10 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from categories.models import Category as SourceCategory
+from core.exceptions import ConflictError
 from core.permissions import AdminModelPermission
 from products import serializers as s
 from products.models import ImportErrorLog, ImportItem, ImportJob, SourceProduct
-from products.services.importer import run_job
 from products.services.review import create_draft_product, ignore_source, link_to_variant
 
 
@@ -19,11 +19,14 @@ class AdminImportJobViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mi
     permission_classes = [AdminModelPermission]
     parser_classes = [JSONParser, MultiPartParser, FormParser]
     filterset_fields = ["status", "dry_run", "source_site"]
-    action_perms = {"create": ["products.run_import"]}
+    action_perms = {"create": ["products.run_import"], "retry": ["products.run_import"]}
 
-    @extend_schema(request=s.CreateImportJobSerializer, responses={201: s.ImportJobSerializer})
+    @extend_schema(request=s.CreateImportJobSerializer, responses={202: s.ImportJobSerializer})
     def create(self, request):
-        """Run an import synchronously (dry-run by default). Items are staged, never published."""
+        """Queue an import (dry-run by default). Executed by ``manage.py process_import_jobs``.
+
+        Items are staged as SourceProducts, never published.
+        """
         ser = s.CreateImportJobSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         d = ser.validated_data
@@ -35,9 +38,19 @@ class AdminImportJobViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mi
             dry_run=d["dry_run"],
             created_by=request.user,
         )
-        html = d["html_file"].read().decode("utf-8", errors="replace") if d.get("html_file") else None
-        job = run_job(job, html=html)
-        return Response(s.ImportJobSerializer(job).data, status=status.HTTP_201_CREATED)
+        if d.get("html_file"):
+            job.source_html = d["html_file"].read().decode("utf-8", errors="replace")
+            job.save(update_fields=["source_html"])
+        return Response(s.ImportJobSerializer(job).data, status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(request=None, responses=s.ImportJobSerializer)
+    @action(detail=True, methods=["post"])
+    def retry(self, request, pk=None):
+        """Re-queue a failed job."""
+        updated = ImportJob.objects.filter(pk=pk, status=ImportJob.Status.FAILED).update(status=ImportJob.Status.PENDING)
+        if not updated:
+            raise ConflictError("Only failed jobs can be retried.", code="not_retryable")
+        return Response(s.ImportJobSerializer(ImportJob.objects.get(pk=pk)).data)
 
 
 class AdminImportItemViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):

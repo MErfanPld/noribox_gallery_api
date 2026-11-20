@@ -30,8 +30,8 @@ class ImportJobSerializer(serializers.ModelSerializer):
     class Meta:
         model = ImportJob
         fields = ["id", "source_site", "source_type", "source_url", "limit", "dry_run", "status", "stats", "log",
-                  "started_at", "finished_at", "created_by", "created_at", "error_count"]
-        read_only_fields = ["status", "stats", "log", "started_at", "finished_at", "created_by", "created_at", "source_type"]
+                  "attempts", "heartbeat_at", "started_at", "finished_at", "created_by", "created_at", "error_count"]
+        read_only_fields = fields
 
 
 class CreateImportJobSerializer(serializers.Serializer):
@@ -40,6 +40,16 @@ class CreateImportJobSerializer(serializers.Serializer):
     source_site = serializers.SlugField(required=False, max_length=64)
     limit = serializers.IntegerField(required=False, allow_null=True, min_value=1, max_value=5000)
     dry_run = serializers.BooleanField(default=True)
+
+    def validate_source_url(self, value):
+        from core.http import FetchError, UnsafeURLError, validate_url
+
+        if value:
+            try:
+                validate_url(value)
+            except (UnsafeURLError, FetchError) as exc:
+                raise serializers.ValidationError(str(exc)) from exc
+        return value
 
     def validate(self, attrs):
         if bool(attrs.get("source_url")) == bool(attrs.get("html_file")):

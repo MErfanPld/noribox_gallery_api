@@ -13,15 +13,15 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Iterable
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from django.conf import settings
 from django.db import transaction
+from django.db.models import F, Q
 from django.utils import timezone
 
+from core.http import FetchError, UnsafeURLError, safe_fetch
 from products.models import ImportErrorLog, ImportItem, ImportJob, SourceProduct
 from products.services.parser import ParsedProduct, parse_listing_html
 
@@ -35,15 +35,17 @@ class SourceUnavailableError(Exception):
 
 
 def fetch_html(url: str, timeout: int | None = None, user_agent: str | None = None) -> str:
-    timeout = timeout or getattr(settings, "IMPORT_REQUEST_TIMEOUT", 15)
-    user_agent = user_agent or getattr(settings, "IMPORT_USER_AGENT", "Mozilla/5.0 (compatible; NoriboxImportBot/1.0)")
-    req = Request(url, headers={"User-Agent": user_agent, "Accept": "text/html"})
+    """Fetch a listing page through the SSRF-safe client (http/https, public hosts only)."""
+    headers = {"Accept": "text/html"}
+    if user_agent:
+        headers["User-Agent"] = user_agent
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.read().decode(charset, errors="replace")
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        result = safe_fetch(url, max_bytes=settings.IMPORT_MAX_PAGE_BYTES, timeout=timeout, headers=headers)
+    except UnsafeURLError as exc:
+        raise SourceUnavailableError(f"Refused to fetch {url!r}: {exc}") from exc
+    except (FetchError, OSError) as exc:
         raise SourceUnavailableError(f"Failed to fetch {url}: {exc}") from exc
+    return result.body.decode(result.charset or "utf-8", errors="replace")
 
 
 def load_fixture(path: Path | str) -> str:
@@ -163,6 +165,8 @@ def import_products(
         if limit is not None and count >= limit:
             break
         count += 1
+        if count % 25 == 0:
+            heartbeat(job)
         item_kwargs = {"external_id": (parsed.source_product_id or "")[:64], "name": (parsed.name or "")[:512]}
         try:
             if not parsed.source_product_id or not parsed.name:
@@ -228,13 +232,18 @@ def iterate_listing_pages(url: str, max_pages: int | None = None):
     visited: set[str] = set()
     current = url
     max_pages = max_pages or getattr(settings, "IMPORT_MAX_PAGES", 50)
+    origin = urlsplit(url).hostname
     while current and current not in visited and len(visited) < max_pages:
         visited.add(current)
-        html = fetch_html(current)
+        html = fetch_html(current)  # every page is SSRF-validated
         yield html
         soup = BeautifulSoup(html, "html.parser")
         nxt = soup.select_one("a.next.page-numbers") or soup.select_one("a[rel='next']")
         current = urljoin(current, nxt.get("href")) if nxt and nxt.get("href") else None
+        # Pagination links come from untrusted HTML: stay on the starting host.
+        if current and urlsplit(current).hostname != origin:
+            logger.warning("Ignoring off-site pagination link %s", current)
+            current = None
 
 
 def run_import_from_url(url, source_site=None, limit=None, base_url=None, job=None, dry_run=False) -> dict:
@@ -244,6 +253,7 @@ def run_import_from_url(url, source_site=None, limit=None, base_url=None, job=No
     stats: dict = {}
     count = 0
     for html in iterate_listing_pages(url):
+        heartbeat(job)
         if limit is not None and count >= limit:
             break
         products = parse_listing_html(html, base_url=base)
@@ -264,10 +274,33 @@ def run_import_from_fixture(fixture_path, source_site=None, limit=None, base_url
     return run_import_from_html(load_fixture(fixture_path), source_site, limit, base_url, job, dry_run)
 
 
+def heartbeat(job: ImportJob | None) -> None:
+    if job is not None and job.pk:
+        ImportJob.objects.filter(pk=job.pk, status=ImportJob.Status.RUNNING).update(heartbeat_at=timezone.now())
+
+
+def claim_job(job: ImportJob) -> bool:
+    """Atomically move a pending job to running. Only one worker can win."""
+    now = timezone.now()
+    won = ImportJob.objects.filter(pk=job.pk, status=ImportJob.Status.PENDING).update(
+        status=ImportJob.Status.RUNNING, started_at=now, heartbeat_at=now, finished_at=None,
+        attempts=F("attempts") + 1, updated_at=now,
+    )
+    return bool(won)
+
+
 def run_job(job: ImportJob, html: str | None = None) -> ImportJob:
-    """Execute an ImportJob, recording status, stats, items and errors."""
-    job.status, job.started_at = ImportJob.Status.RUNNING, timezone.now()
-    job.save(update_fields=["status", "started_at", "updated_at"])
+    """Claim and execute a pending ImportJob, recording status, stats, items and errors.
+
+    Returns the job unchanged if another worker already claimed it.
+    """
+    if not claim_job(job):
+        job.refresh_from_db()
+        logger.info("Import job %s not pending (status=%s); skipping", job.pk, job.status)
+        return job
+    job.refresh_from_db()
+    job.items.all().delete()  # an interrupted earlier attempt may have left partial items
+    html = html if html is not None else job.source_html
     try:
         if job.source_type == ImportJob.SourceType.URL:
             stats = run_import_from_url(job.source_url, job.source_site, job.limit, job=job, dry_run=job.dry_run)
@@ -277,6 +310,7 @@ def run_job(job: ImportJob, html: str | None = None) -> ImportJob:
             stats = run_import_from_html(html or "", job.source_site, job.limit, job=job, dry_run=job.dry_run)
         job.status = ImportJob.Status.COMPLETED
         job.stats = stats
+        job.source_html = ""  # no longer needed
     except Exception as exc:  # noqa: BLE001
         job.status = ImportJob.Status.FAILED
         job.log = f"{exc.__class__.__name__}: {exc}"[:10000]
@@ -285,3 +319,38 @@ def run_job(job: ImportJob, html: str | None = None) -> ImportJob:
     job.finished_at = timezone.now()
     job.save()
     return job
+
+
+def recover_stale_jobs(now=None) -> dict:
+    """Re-queue (or fail) jobs whose worker died while 'running'."""
+    from datetime import timedelta
+
+    now = now or timezone.now()
+    cutoff = now - timedelta(minutes=settings.IMPORT_STALE_MINUTES)
+    stale = ImportJob.objects.filter(status=ImportJob.Status.RUNNING).filter(
+        Q(heartbeat_at__lt=cutoff) | Q(heartbeat_at__isnull=True, started_at__lt=cutoff)
+    )
+    result = {"requeued": 0, "failed": 0}
+    for job in stale:
+        msg = f"Worker stopped responding (last heartbeat {job.heartbeat_at or job.started_at})."
+        if job.attempts < settings.IMPORT_MAX_ATTEMPTS:
+            changed = ImportJob.objects.filter(pk=job.pk, status=ImportJob.Status.RUNNING).update(
+                status=ImportJob.Status.PENDING, log=msg + " Re-queued.", updated_at=now)
+            result["requeued"] += changed
+        else:
+            changed = ImportJob.objects.filter(pk=job.pk, status=ImportJob.Status.RUNNING).update(
+                status=ImportJob.Status.FAILED, log=msg + " Giving up.", finished_at=now, updated_at=now)
+            result["failed"] += changed
+        if changed:
+            ImportErrorLog.objects.create(job=job, message=msg)
+    return result
+
+
+def process_pending_jobs(limit=5) -> list:
+    """Worker entry point (management command / cron). Runs pending jobs oldest first."""
+    recover_stale_jobs()
+    done = []
+    for job in ImportJob.objects.filter(status=ImportJob.Status.PENDING).order_by("created_at")[:limit]:
+        job = run_job(job)
+        done.append((job.pk, job.status))
+    return done
