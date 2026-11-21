@@ -34,6 +34,37 @@ class SourceUnavailableError(Exception):
     """Raised when the remote source cannot be reached."""
 
 
+class ImportCancelled(Exception):
+    """Raised at a checkpoint when an administrator cancelled the running job."""
+
+
+def source_category_for_url(url: str | None, source_site: str):
+    """A WooCommerce category listing (``/product-category/<slug>/``) → staged source category.
+
+    Lets admins map it to an internal catalog category once; drafts created from its
+    products then get that category automatically. Returns None for other URLs.
+    """
+    from urllib.parse import unquote
+
+    from categories.models import Category as SourceCategory
+
+    if not url:
+        return None
+    parts = [p for p in urlsplit(url).path.split("/") if p]
+    if "product-category" not in parts:
+        return None
+    slugs = parts[parts.index("product-category") + 1:]
+    slugs = [s for s in slugs if s != "page" and not s.isdigit()]
+    if not slugs:
+        return None
+    slug = unquote(slugs[-1])[:255]
+    cat, _ = SourceCategory.objects.get_or_create(
+        source_site=source_site, slug=slug,
+        defaults={"name": slug.replace("-", " "), "source_url": url[:1024]},
+    )
+    return cat
+
+
 def fetch_html(url: str, timeout: int | None = None, user_agent: str | None = None) -> str:
     """Fetch a listing page through the SSRF-safe client (http/https, public hosts only)."""
     headers = {"Accept": "text/html"}
@@ -153,18 +184,21 @@ def import_products(
     limit: int | None = None,
     job: ImportJob | None = None,
     dry_run: bool = False,
+    source_category=None,
 ) -> dict:
     source_site = source_site or getattr(settings, "SOURCE_SITE_ID", "mehrdadgallery")
     if limit is None:
         limit = getattr(settings, "IMPORT_DEFAULT_LIMIT", None)
 
-    stats = {"created": 0, "updated": 0, "unchanged": 0, "skipped": 0, "duplicates": 0, "errors": 0}
+    heartbeat(job)  # cancellation checkpoint
+    stats = {"discovered": 0, "created": 0, "updated": 0, "unchanged": 0, "skipped": 0, "duplicates": 0, "errors": 0}
     seen: set[str] = set()
     count = 0
     for parsed in products:
         if limit is not None and count >= limit:
             break
         count += 1
+        stats["discovered"] += 1
         if count % 25 == 0:
             heartbeat(job)
         item_kwargs = {"external_id": (parsed.source_product_id or "")[:64], "name": (parsed.name or "")[:512]}
@@ -186,6 +220,8 @@ def import_products(
                 continue
             with transaction.atomic():
                 obj, action, changes = stage_product(parsed, source_site, dry_run=dry_run)
+                if source_category is not None and obj is not None and obj.pk and not dry_run:
+                    obj.categories.add(source_category)
             key = {
                 ImportItem.Action.CREATED: "created", ImportItem.Action.WOULD_CREATE: "created",
                 ImportItem.Action.UPDATED: "updated", ImportItem.Action.WOULD_UPDATE: "updated",
@@ -196,6 +232,8 @@ def import_products(
             if key == "unchanged":
                 stats["unchanged"] += 1
             _record(job, action, item_kwargs, changes, obj, parsed)
+        except ImportCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001
             stats["errors"] += 1
             logger.exception("Error importing product %s", parsed.source_product_id)
@@ -252,6 +290,7 @@ def run_import_from_url(url, source_site=None, limit=None, base_url=None, job=No
         limit = getattr(settings, "IMPORT_DEFAULT_LIMIT", None)
     stats: dict = {}
     count = 0
+    category = None if dry_run else source_category_for_url(url, source_site or settings.SOURCE_SITE_ID)
     for html in iterate_listing_pages(url):
         heartbeat(job)
         if limit is not None and count >= limit:
@@ -259,9 +298,10 @@ def run_import_from_url(url, source_site=None, limit=None, base_url=None, job=No
         products = parse_listing_html(html, base_url=base)
         remaining = None if limit is None else limit - count
         batch = products if remaining is None else products[:remaining]
-        _merge(stats, import_products(batch, source_site=source_site, limit=remaining, job=job, dry_run=dry_run))
+        _merge(stats, import_products(batch, source_site=source_site, limit=remaining, job=job, dry_run=dry_run,
+                                      source_category=category))
         count += len(batch)
-    return stats or {"created": 0, "updated": 0, "unchanged": 0, "skipped": 0, "duplicates": 0, "errors": 0}
+    return stats or {"discovered": 0, "created": 0, "updated": 0, "unchanged": 0, "skipped": 0, "duplicates": 0, "errors": 0}
 
 
 def run_import_from_html(html, source_site=None, limit=None, base_url=None, job=None, dry_run=False) -> dict:
@@ -275,8 +315,11 @@ def run_import_from_fixture(fixture_path, source_site=None, limit=None, base_url
 
 
 def heartbeat(job: ImportJob | None) -> None:
+    """Liveness checkpoint; also where an admin cancellation takes effect."""
     if job is not None and job.pk:
         ImportJob.objects.filter(pk=job.pk, status=ImportJob.Status.RUNNING).update(heartbeat_at=timezone.now())
+        if ImportJob.objects.filter(pk=job.pk, cancel_requested=True).exists():
+            raise ImportCancelled("Cancelled by an administrator.")
 
 
 def claim_job(job: ImportJob) -> bool:
@@ -308,9 +351,12 @@ def run_job(job: ImportJob, html: str | None = None) -> ImportJob:
             stats = run_import_from_fixture(job.fixture_path, job.source_site, job.limit, job=job, dry_run=job.dry_run)
         else:
             stats = run_import_from_html(html or "", job.source_site, job.limit, job=job, dry_run=job.dry_run)
-        job.status = ImportJob.Status.COMPLETED
+        job.status = ImportJob.Status.COMPLETED_WITH_ERRORS if stats.get("errors") else ImportJob.Status.COMPLETED
         job.stats = stats
         job.source_html = ""  # no longer needed
+    except ImportCancelled as exc:
+        job.status = ImportJob.Status.CANCELLED
+        job.log = str(exc)
     except Exception as exc:  # noqa: BLE001
         job.status = ImportJob.Status.FAILED
         job.log = f"{exc.__class__.__name__}: {exc}"[:10000]

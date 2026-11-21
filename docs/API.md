@@ -109,6 +109,14 @@ Receipt response:
 
 `pages/{slug}/` · `blog/categories/` · `blog/posts/` (`?category__slug=`, `?search=`) · `blog/posts/{slug}/` ·
 `faqs/` (`?group=`) · `banners/` (`?position=home_top`) · `sliders/{code}/` · `store-settings/` · `seo/?path=/brands`
+· `navigation/{header|footer}/` (published snapshot) · `homepage/` (active sections, resolved content)
+
+Navigation item `link`: `{type: internal|external, url}` · `{type: page|category|brand|blog_category, slug}` ·
+`{type: none}` (heading/dropdown). Items carry `open_in_new_tab`, `nofollow`, `show_on_desktop`,
+`show_on_mobile`, `children` (≤ 3 levels). `auto_children: "categories"` lists categories with
+`show_in_navigation=true` at request time. Public CMS payloads are cached and invalidated on any edit.
+`store-settings` never exposes `admin_notification_phones`; with `maintenance_enabled` new orders get
+`503 store_maintenance`.
 
 ## Management `/api/admin/` (staff + permission)
 
@@ -117,13 +125,16 @@ Receipt response:
 | Users & roles | `users/`, `roles/` | role/staff changes need `accounts.manage_roles` |
 | Catalog | `categories/`, `brands/`, `attributes/`, `attribute-options/`, `category-attributes/`, `products/`, `variants/`, `product-images/` (multipart) | `products/{id}/publish/`, `unpublish/`, `archive/` (`catalog.publish_product`) |
 | Inventory | `inventory/availability/`, `inventory/reservations/` | `availability/{id}/set-state/` `{state: available\|unavailable, note}`, `reservations/{id}/release/` (`inventory.manage_inventory`) |
-| Imports | `imports/jobs/` (POST **queues** a job → 202 `pending`: `source_url` (public http/https only) or multipart `html_file`, `limit`, `dry_run` default true — `products.run_import`; `jobs/{id}/retry/` re-queues a failed job), `imports/items/`, `imports/errors/`, `imports/source-products/`, `imports/source-categories/` (map `mapped_category`) | `source-products/{id}/create-draft/` `{price?, sku?, name?, label?, category?, brand?, download_images?}`, `link-variant/` `{variant}`, `ignore/` (`products.review_sourceproduct`) |
-| Orders | `orders/` (`?needs_review=true`, `?status=`) | `orders/{id}/transition/` `{status, note}`, `clear-review/` (`commerce.manage_order_status`); `record-refund/` `{reference, note?}` (`commerce.record_refund`) for cancelled paid orders (`refund_status: pending → refunded`) |
+| Imports | `imports/jobs/` (POST **queues** a job → 202 `pending`: `source_url` (public http/https only) or multipart `html_file`, `limit`, `dry_run` default true — `products.run_import`; statuses `pending, running, completed, completed_with_errors, failed, cancelled`; `jobs/{id}/retry/` re-queues failed/partial/cancelled jobs, `jobs/{id}/cancel/`), `imports/items/` (`?job=`), `imports/errors/`, `imports/source-products/` (`?review_status=`, `?import_items__job=`, `summary/`), `imports/source-categories/` (map `mapped_category`) | `source-products/{id}/approve/` `{category?, price?, publish=true, …}` creates the draft (if not linked) and publishes it in one transaction (`+ catalog.publish_product`); `reject/` `{reason?}`, `restore/`, `bulk/` `{ids, operation: approve\|create_draft\|reject\|restore, category?}`, `create-draft/`, `link-variant/`, `ignore/` (`products.review_sourceproduct`) |
+| Customers | `customers/` (non-staff; `order_count`, `paid_total` from paid orders only; detail adds addresses, orders, activity) | `customers/{id}/set-active/` `{is_active, reason?}` revokes tokens on disable (`accounts.change_user`) |
+| Orders | `orders/` (`?needs_review=true`, `?status=`, `?status__in=`, `?created_after=`, `?created_before=`, `?payment_status=`, `?search=` number/phone/name); `orders/{id}/notes/` GET/POST internal notes | `orders/{id}/transition/` `{status, note}`, `clear-review/` (`commerce.manage_order_status`); `record-refund/` `{reference, note?}` (`commerce.record_refund`) for cancelled paid orders (`refund_status: pending → refunded`) |
 | Payments | `payments/`, `receipts/`, `receipts/{id}/file/`, `payment-methods/`, `bank-cards/` | `receipts/{id}/approve/` `{reason?}`, `receipts/{id}/reject/` `{reason}`, `receipts/{id}/retry-reservation/` (`payments.review_payment`) |
 | Shipping | `shipping-methods/`, `shipments/` (tracking fields; status via order transitions) | |
 | Notifications | `notifications/sms-templates/` (+ `defaults/`), `notifications/sms-logs/` | `sms-logs/{id}/retry/` (`notifications.retry_sms`) |
-| CMS | `cms/pages/`, `cms/blog-categories/`, `cms/blog-posts/`, `cms/faqs/`, `cms/banners/`, `cms/sliders/`, `cms/slides/`, `cms/seo/`, `store-settings/` (GET/PATCH) | |
-| Reports | `reports/summary/?days=30` | revenue, orders by status, review queue, inventory states, daily series |
+| CMS | `cms/pages/` (`show_in_header`/`show_in_footer` add a link to the menu draft), `cms/blog-categories/`, `cms/blog-posts/` (`related_posts`, future `published_at` = scheduled), `cms/faqs/`, `cms/banners/`, `cms/sliders/`, `cms/slides/`, `cms/seo/`, `store-settings/` (GET/PATCH), `cms/homepage-sections/` (+ `reorder/` `{ids}`, `preview/`) | |
+| Navigation | `cms/navigation-menus/` (`{id}/tree/`, `{id}/preview/`, `{id}/reorder/` `{items:[{id,parent,sort_order}]}`), `cms/navigation-items/` | `{id}/publish/` (`cms.publish_navigationmenu`) |
+| Reports | `reports/summary/?days=30`, `dashboard/?days=30` | revenue, orders by status, queues, recent orders/imports |
+| Staff | `me/` (effective permissions), `audit-logs/` (who approved/published/changed what) | |
 
 Approve conflict example (HTTP 409):
 ```json

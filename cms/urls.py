@@ -13,5 +13,7 @@ router.register("sliders", views.SliderViewSet, basename="slider")
 urlpatterns = [
     path("store-settings/", views.StoreSettingsView.as_view(), name="store-settings"),
     path("seo/", views.SEOMetadataView.as_view(), name="seo-metadata"),
+    path("navigation/<slug:location>/", views.NavigationView.as_view(), name="navigation"),
+    path("homepage/", views.HomepageView.as_view(), name="homepage"),
     *router.urls,
 ]

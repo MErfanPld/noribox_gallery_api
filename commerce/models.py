@@ -141,3 +141,15 @@ class OrderStatusHistory(models.Model):
     class Meta:
         ordering = ["created_at", "id"]
         verbose_name_plural = "order status history"
+
+
+class OrderNote(models.Model):
+    """Internal staff note on an order. Never exposed to customers."""
+
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="notes")
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="+")
+    body = models.TextField(max_length=4000)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]

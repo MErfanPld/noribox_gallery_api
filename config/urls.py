@@ -35,6 +35,7 @@ admin_api = [
     path("", include("commerce.admin_urls")),
     path("", include("notifications.admin_urls")),
     path("", include("cms.admin_urls")),
+    path("", include("core.admin_urls")),
 ]
 
 urlpatterns = [

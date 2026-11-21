@@ -208,3 +208,66 @@ class GroupSerializer(serializers.ModelSerializer):
     class Meta:
         model = Group
         fields = ["id", "name", "permissions"]
+
+
+class AdminCustomerSerializer(serializers.ModelSerializer):
+    """Customer CRM row. Money totals only count orders paid through an approved payment."""
+
+    full_name = serializers.CharField(source="get_full_name", read_only=True)
+    order_count = serializers.IntegerField(read_only=True)
+    paid_order_count = serializers.IntegerField(read_only=True)
+    paid_total = serializers.IntegerField(read_only=True)
+    last_order_at = serializers.DateTimeField(read_only=True)
+
+    class Meta:
+        model = User
+        fields = ["id", "phone", "first_name", "last_name", "full_name", "email", "is_active", "phone_verified_at",
+                  "date_joined", "last_login", "order_count", "paid_order_count", "paid_total", "last_order_at"]
+        read_only_fields = fields
+
+
+class AdminCustomerDetailSerializer(AdminCustomerSerializer):
+    addresses = AddressSerializer(many=True, read_only=True)
+    recent_orders = serializers.SerializerMethodField()
+    activity = serializers.SerializerMethodField()
+
+    class Meta(AdminCustomerSerializer.Meta):
+        fields = AdminCustomerSerializer.Meta.fields + ["national_code", "addresses", "recent_orders", "activity"]
+        read_only_fields = fields
+
+    def get_recent_orders(self, obj) -> list:
+        return [{"id": o.pk, "number": o.number, "status": o.status, "total": o.total, "created_at": o.created_at,
+                 "paid_at": o.paid_at} for o in obj.orders.order_by("-created_at")[:20]]
+
+    def get_activity(self, obj) -> list:
+        """Timeline built only from recorded events (registration, orders, receipts)."""
+        from payments.models import PaymentReceipt
+
+        events = [{"type": "registered", "at": obj.date_joined}]
+        if obj.last_login:
+            events.append({"type": "last_login", "at": obj.last_login})
+        for o in obj.orders.order_by("-created_at")[:10]:
+            events.append({"type": "order_created", "at": o.created_at, "order": o.number})
+        for r in PaymentReceipt.objects.filter(uploaded_by=obj).select_related("payment__order").order_by("-created_at")[:10]:
+            events.append({"type": "receipt_uploaded", "at": r.created_at, "order": r.payment.order.number, "status": r.status})
+        return sorted(events, key=lambda e: e["at"], reverse=True)
+
+
+class SetActiveSerializer(serializers.Serializer):
+    is_active = serializers.BooleanField()
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=500, default="")
+
+
+class AdminMeSerializer(serializers.ModelSerializer):
+    full_name = serializers.CharField(source="get_full_name", read_only=True)
+    permissions = serializers.SerializerMethodField()
+    roles = serializers.SlugRelatedField(source="groups", slug_field="name", many=True, read_only=True)
+
+    class Meta:
+        model = User
+        fields = ["id", "phone", "first_name", "last_name", "full_name", "is_staff", "is_superuser", "roles", "permissions"]
+
+    def get_permissions(self, obj) -> list:
+        if obj.is_superuser:
+            return ["*"]
+        return sorted(obj.get_all_permissions())

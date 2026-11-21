@@ -21,7 +21,7 @@ class SourceProduct(models.Model):
     class ReviewStatus(models.TextChoices):
         PENDING = "pending", "Pending review"
         LINKED = "linked", "Linked to catalog"
-        IGNORED = "ignored", "Ignored"
+        IGNORED = "ignored", "Ignored / rejected"
 
     source_site = models.CharField(max_length=64, db_index=True)
     source_product_id = models.CharField(max_length=64, db_index=True)
@@ -86,7 +86,11 @@ class ImportJob(TimeStampedModel):
         PENDING = "pending", "Pending"
         RUNNING = "running", "Running"
         COMPLETED = "completed", "Completed"
+        COMPLETED_WITH_ERRORS = "completed_with_errors", "Completed with errors"
         FAILED = "failed", "Failed"
+        CANCELLED = "cancelled", "Cancelled"
+
+    RETRYABLE = ("failed", "completed_with_errors", "cancelled")
 
     class SourceType(models.TextChoices):
         URL = "url", "Live URL"
@@ -99,11 +103,12 @@ class ImportJob(TimeStampedModel):
     fixture_path = models.CharField(max_length=1024, blank=True, default="")
     limit = models.PositiveIntegerField(null=True, blank=True)
     dry_run = models.BooleanField(default=False)
-    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING, db_index=True)
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.PENDING, db_index=True)
     stats = models.JSONField(default=dict, blank=True)
     log = models.TextField(blank=True, default="")
     source_html = models.TextField(blank=True, default="", help_text="Uploaded HTML awaiting processing")
     attempts = models.PositiveSmallIntegerField(default=0)
+    cancel_requested = models.BooleanField(default=False, help_text="Set by an admin; a running worker stops at the next checkpoint.")
     heartbeat_at = models.DateTimeField(null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)

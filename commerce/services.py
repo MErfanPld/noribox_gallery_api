@@ -102,7 +102,13 @@ def set_status(order, to_status, user=None, note=""):
 @transaction.atomic
 def create_order(user, address, shipping_method, customer_note=""):
     """Create an order from the user's cart. Does NOT reserve inventory."""
+    from cms.models import StoreSettings
     from shipping.models import Shipment
+
+    store = StoreSettings.load()
+    if store.maintenance_enabled:
+        raise ServiceError(store.maintenance_message or "Store is temporarily not accepting orders.",
+                           code="store_maintenance", status_code=503)
 
     cart = Cart.objects.select_for_update().filter(user=user).first()
     if cart is None:

@@ -7,6 +7,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from catalog.models import Product, ProductCategory, ProductImage, ProductVariant
+from core import audit
 from core.exceptions import ConflictError, ServiceError
 from core.files import detect_kind
 from core.http import FetchError, UnsafeURLError, safe_fetch
@@ -57,6 +58,8 @@ def create_draft_product(source, user, *, price=None, sku=None, category=None, b
     product = Product.objects.create(
         name=name or source.name, brand=brand, status=Product.Status.DRAFT,
     )
+    if category is None:
+        category = mapped_category_for(source)
     if category is not None:
         ProductCategory.objects.create(product=product, category=category, is_primary=True)
     compare = source.effective_compare_at
@@ -70,12 +73,47 @@ def create_draft_product(source, user, *, price=None, sku=None, category=None, b
         source_compare_at_price=source.effective_compare_at,
         source_price_updated_at=timezone.now() if source.effective_price else None,
     )
+    if source.availability == SourceProduct.Availability.OUT_OF_STOCK:
+        from inventory.models import AvailabilityState
+        from inventory.services import set_availability
+
+        set_availability(variant, AvailabilityState.UNAVAILABLE, user, note="Out of stock at import source")
     if download_images and source.image_url:
         content = download_image(source.image_url)
         if content is not None:
             img = ProductImage(product=product, variant=variant, is_primary=True, alt_text=product.name, source_url=source.image_url)
             img.image.save(content.name, content, save=True)
     _mark_linked(source, product, variant, user)
+    audit.record(user, "import.create_draft", source, {"product_id": product.pk})
+    return product
+
+
+def mapped_category_for(source):
+    """Internal category mapped (by an admin) from one of the source's staged categories."""
+    src_cat = source.categories.filter(mapped_category__isnull=False).select_related("mapped_category").first()
+    return src_cat.mapped_category if src_cat else None
+
+
+@transaction.atomic
+def approve_source(source, user, *, publish=True, **draft_kwargs):
+    """Approve a staged product: create its catalog draft and (optionally) publish it.
+
+    Runs in one transaction: if publishing is refused, no orphan draft remains.
+    Already-linked sources publish their existing linked product instead.
+    """
+    from catalog.services import set_product_status
+
+    source = SourceProduct.objects.select_for_update().get(pk=source.pk)
+    if source.linked_product_id:
+        product = source.linked_product
+    else:
+        product = create_draft_product(source, user, **draft_kwargs)
+    if publish:
+        if not product.product_categories.exists():
+            raise ServiceError("Choose a category before publishing (or map the source category).",
+                               code="category_required")
+        set_product_status(product, Product.Status.PUBLISHED, user)
+    audit.record(user, "import.approve", source, {"product_id": product.pk, "published": publish})
     return product
 
 
@@ -94,8 +132,22 @@ def link_to_variant(source, variant, user):
     return source
 
 
-def ignore_source(source, user):
+def ignore_source(source, user, reason=""):
+    """Reject an import. Linked sources must be unlinked by archiving the product instead."""
+    if source.linked_product_id:
+        raise ConflictError("Already linked to a catalog product; archive that product instead.", code="already_linked")
     source.review_status = SourceProduct.ReviewStatus.IGNORED
     source.reviewed_by, source.reviewed_at = user, timezone.now()
     source.save(update_fields=["review_status", "reviewed_by", "reviewed_at", "updated_at"])
+    audit.record(user, "import.reject", source, {"reason": reason[:500]})
+    return source
+
+
+def restore_source(source, user):
+    if source.review_status != SourceProduct.ReviewStatus.IGNORED:
+        raise ConflictError("Only rejected imports can be restored.", code="not_rejected")
+    source.review_status = SourceProduct.ReviewStatus.PENDING
+    source.reviewed_by, source.reviewed_at = user, timezone.now()
+    source.save(update_fields=["review_status", "reviewed_by", "reviewed_at", "updated_at"])
+    audit.record(user, "import.restore", source)
     return source

@@ -55,7 +55,7 @@ cp .env.example .env            # set POSTGRES_PASSWORD, DJANGO_SECRET_KEY, REDI
 createdb noribox                # or use DB_ENGINE=sqlite for a quick try
 python manage.py migrate
 python manage.py setup_roles    # RBAC groups
-python manage.py seed_defaults  # bank-transfer method, shipping methods, store settings
+python manage.py seed_defaults  # bank-transfer method, shipping methods, store settings, starter menus + homepage
 python manage.py createsuperuser
 python manage.py runserver
 python manage.py test           # uses config.settings.test automatically
@@ -91,6 +91,8 @@ Changing `is_staff`/roles requires superuser or `accounts.manage_roles`.
 ```bash
 python manage.py import_source_products --fixture products/fixtures/mehrdadgallery_shop_sample.html --dry-run
 python manage.py import_source_products --url https://mehrdadgallery.com/shop/ --limit 50
+# Imported products are STAGED (imports/source-products, review_status=pending). They appear in the
+# store only after an admin approves them (POST imports/source-products/{id}/approve/ or the admin UI).
 ```
 
 The admin API (`POST /api/admin/imports/jobs/`) only **queues** a job (HTTP 202);

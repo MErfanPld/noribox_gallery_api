@@ -42,6 +42,7 @@ class Category(SlugMixin, SEOFields, TimeStampedModel):
     description = models.TextField(blank=True, default="")
     image = models.ImageField(upload_to="categories/", blank=True, validators=[ImageUploadValidator()])
     is_active = models.BooleanField(default=True, db_index=True)
+    show_in_navigation = models.BooleanField(default=False, help_text="Listed under menu items set to auto-list categories")
     sort_order = models.PositiveIntegerField(default=0)
     attributes = models.ManyToManyField("Attribute", through="CategoryAttribute", related_name="categories", blank=True)
 
@@ -67,9 +68,10 @@ class Brand(SlugMixin, SEOFields, TimeStampedModel):
     description = models.TextField(blank=True, default="")
     country = models.CharField(max_length=100, blank=True, default="")
     is_active = models.BooleanField(default=True, db_index=True)
+    sort_order = models.PositiveIntegerField(default=0)
 
     class Meta:
-        ordering = ["name"]
+        ordering = ["sort_order", "name"]
 
     def __str__(self):
         return self.name

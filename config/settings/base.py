@@ -177,6 +177,7 @@ SPECTACULAR_SETTINGS = {
         "ImportJobStatusEnum": "products.models.ImportJob.Status",
         "SMSStatusEnum": "notifications.models.SMSLog.Status",
         "PublishStatusEnum": "core.models.PublishStatus",
+        "HomepageSectionKindEnum": "cms.models.HomepageSection.Kind",
     },
     "SECURITY": [{"jwtAuth": []}],
 }

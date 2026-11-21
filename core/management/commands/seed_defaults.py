@@ -1,3 +1,4 @@
+from django.core.management import call_command
 from django.core.management.base import BaseCommand
 
 from cms.models import StoreSettings
@@ -17,4 +18,5 @@ class Command(BaseCommand):
         ShippingMethod.objects.get_or_create(code="post", defaults={"name": "پست پیشتاز", "cost": 60000})
         ShippingMethod.objects.get_or_create(code="courier", defaults={"name": "پیک (تهران)", "cost": 90000, "supports_tracking": False})
         StoreSettings.load()
+        call_command("seed_storefront", stdout=self.stdout)
         self.stdout.write(self.style.SUCCESS("Defaults ensured."))

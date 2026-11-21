@@ -39,7 +39,7 @@ class Command(BaseCommand):
             job.source_type, job.source_url = ImportJob.SourceType.URL, url
         job.save()
         job = run_job(job)
-        if job.status == ImportJob.Status.FAILED:
+        if job.status in (ImportJob.Status.FAILED, ImportJob.Status.CANCELLED):
             raise CommandError(
                 f"Import job #{job.pk} failed: {job.log}\nIf the source is unreachable, re-run with "
                 "--fixture path/to/listing.html to test the parser against a saved HTML sample."
@@ -51,5 +51,14 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f"Import job #{job.pk} {'(dry-run) ' if job.dry_run else ''}finished: created={s.get('created', 0)} "
             f"updated={s.get('updated', 0)} unchanged={s.get('unchanged', 0)} skipped={s.get('skipped', 0)} "
-            f"duplicates={s.get('duplicates', 0)} errors={s.get('errors', 0)}"
+            f"duplicates={s.get('duplicates', 0)} errors={s.get('errors', 0)} status={job.status}"
         ))
+        if not job.dry_run:
+            from products.models import SourceProduct
+
+            pending = SourceProduct.objects.filter(review_status=SourceProduct.ReviewStatus.PENDING).count()
+            self.stdout.write(self.style.WARNING(
+                "Imported products are STAGED for review, not shown in the store. "
+                f"{pending} product(s) await review: approve them in the admin panel (Imports → Imported products) "
+                "or via POST /api/admin/imports/source-products/<id>/approve/."
+            ))

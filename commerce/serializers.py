@@ -2,7 +2,7 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from catalog.serializers import PublicVariantSerializer
-from commerce.models import Cart, CartItem, Order, OrderItem, OrderStatusHistory
+from commerce.models import Cart, CartItem, Order, OrderItem, OrderStatusHistory, OrderNote
 from payments.serializers import PaymentSerializer
 from shipping.serializers import ShipmentSerializer
 
@@ -131,14 +131,71 @@ class CreateOrderSerializer(serializers.Serializer):
     customer_note = serializers.CharField(required=False, allow_blank=True, max_length=2000)
 
 
+class OrderNoteSerializer(serializers.ModelSerializer):
+    author_phone = serializers.CharField(source="author.phone", read_only=True, default=None)
+    author_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderNote
+        fields = ["id", "body", "author_phone", "author_name", "created_at"]
+        read_only_fields = ["id", "author_phone", "author_name", "created_at"]
+
+    def get_author_name(self, obj) -> str:
+        return obj.author.get_full_name() if obj.author else ""
+
+    def validate_body(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("یادداشت خالی است.")
+        return value.strip()
+
+
+class AdminOrderListSerializer(serializers.ModelSerializer):
+    user_phone = serializers.CharField(source="user.phone", read_only=True)
+    customer_name = serializers.SerializerMethodField()
+    item_count = serializers.IntegerField(read_only=True)
+    payment_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Order
+        fields = ["id", "number", "status", "user", "user_phone", "customer_name", "recipient_name", "total",
+                  "item_count", "payment_status", "needs_review", "refund_status", "created_at", "paid_at"]
+
+    def get_customer_name(self, obj) -> str:
+        return obj.user.get_full_name() if obj.user_id else ""
+
+    def get_payment_status(self, obj) -> str | None:
+        payments = list(obj.payments.all())
+        return payments[-1].status if payments else None
+
+
 class AdminOrderSerializer(OrderDetailSerializer):
     user_phone = serializers.CharField(source="user.phone", read_only=True)
+    customer_name = serializers.SerializerMethodField()
     history = serializers.SerializerMethodField()
+    notes = OrderNoteSerializer(many=True, read_only=True)
+    allowed_transitions = serializers.SerializerMethodField()
 
     class Meta(OrderDetailSerializer.Meta):
-        fields = ["id", "user", "user_phone", *OrderDetailSerializer.Meta.fields, "admin_note", "needs_review", "review_reason",
-                  "refund_status", "refund_reference", "refunded_at", "updated_at"]
+        fields = ["id", "user", "user_phone", "customer_name", *OrderDetailSerializer.Meta.fields, "admin_note",
+                  "needs_review", "review_reason", "refund_status", "refund_reference", "refunded_at", "updated_at",
+                  "notes", "allowed_transitions"]
         read_only_fields = [f for f in fields if f not in ("admin_note",)]
+
+    def get_customer_name(self, obj) -> str:
+        return obj.user.get_full_name() if obj.user_id else ""
+
+    @extend_schema_field(serializers.DictField(allow_null=True))
+    def get_payment(self, obj):
+        from payments.serializers import AdminPaymentSerializer
+        from payments.services import current_payment
+
+        payment = current_payment(obj)
+        return AdminPaymentSerializer(payment, context=self.context).data if payment else None
+
+    def get_allowed_transitions(self, obj) -> list:
+        from commerce.services import ADMIN_TRANSITIONS
+
+        return sorted(ADMIN_TRANSITIONS.get(obj.status, set()))
 
     def get_history(self, obj) -> list:
         return [

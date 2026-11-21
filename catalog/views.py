@@ -1,7 +1,7 @@
 from django.db import transaction
-from django.db.models import Exists, ProtectedError, OuterRef, Prefetch, Subquery
+import django_filters
+from django.db.models import Count, Exists, OuterRef, Prefetch, ProtectedError, Q, Subquery
 from django.db.models.functions import Coalesce
-from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import permissions, viewsets
@@ -11,12 +11,14 @@ from rest_framework.response import Response
 
 from catalog import serializers as s
 from catalog.filters import ProductFilter
+from catalog.services import set_product_status
 from catalog.models import (
     Attribute, AttributeOption, Brand, Category, CategoryAttribute, Product, ProductAttributeValue,
     ProductImage, ProductVariant,
 )
 from core.exceptions import ConflictError, ServiceError, protected_conflict
 from core.permissions import AdminModelPermission
+from products.models import SourceProduct
 
 
 def annotate_products(qs):
@@ -158,9 +160,26 @@ class AdminCategoryAttributeViewSet(AdminViewSet):
     filterset_fields = ["category", "attribute"]
 
 
+class AdminProductFilter(django_filters.FilterSet):
+    availability = django_filters.ChoiceFilter(
+        choices=[("available", "available"), ("reserved", "reserved"), ("unavailable", "unavailable")],
+        method="filter_availability")
+    imported = django_filters.BooleanFilter(method="filter_imported")
+
+    class Meta:
+        model = Product
+        fields = ["status", "brand", "is_featured", "categories"]
+
+    def filter_availability(self, qs, name, value):
+        return qs.filter(variants__is_active=True, variants__availability__state=value).distinct()
+
+    def filter_imported(self, qs, name, value):
+        return qs.filter(source_products__isnull=not value).distinct()
+
+
 class AdminProductViewSet(AdminViewSet):
     serializer_class = s.AdminProductSerializer
-    filterset_fields = ["status", "brand", "is_featured", "categories"]
+    filterset_class = AdminProductFilter
     search_fields = ["name", "slug", "variants__sku"]
     ordering_fields = ["created_at", "updated_at", "name", "published_at"]
     action_perms = {
@@ -170,19 +189,28 @@ class AdminProductViewSet(AdminViewSet):
     }
 
     def get_queryset(self):
+        if self.action == "list":
+            active = ProductVariant.objects.filter(product=OuterRef("pk"), is_active=True)
+            return Product.objects.select_related("brand").prefetch_related(
+                "product_categories__category",
+                Prefetch("images", queryset=ProductImage.objects.order_by("-is_primary", "sort_order", "id")),
+            ).annotate(
+                min_price=Subquery(active.order_by("price").values("price")[:1]),
+                variant_count=Count("variants", distinct=True),
+                available_count=Count("variants", filter=Q(variants__availability__state="available", variants__is_active=True), distinct=True),
+                reserved_count=Count("variants", filter=Q(variants__availability__state="reserved"), distinct=True),
+                imported=Exists(SourceProduct.objects.filter(linked_product=OuterRef("pk"))),
+            )
         return Product.objects.select_related("brand").prefetch_related(
             "product_categories", "attribute_values__options", "images",
             Prefetch("variants", queryset=ProductVariant.objects.select_related("availability")),
         ).distinct()
 
+    def get_serializer_class(self):
+        return s.AdminProductListSerializer if self.action == "list" else s.AdminProductSerializer
+
     def _set_status(self, request, status):
-        product = self.get_object()
-        if status == Product.Status.PUBLISHED:
-            if not product.variants.filter(is_active=True).exists():
-                raise ServiceError("A product needs at least one active variant to be published.", code="no_variants")
-            product.published_at = product.published_at or timezone.now()
-        product.status = status
-        product.save(update_fields=["status", "published_at", "updated_at"])
+        product = set_product_status(self.get_object(), status, request.user)
         return Response(self.get_serializer(product).data)
 
     def perform_destroy(self, instance):

@@ -128,9 +128,15 @@ class ProductDetailSerializer(ProductListSerializer):
 class AdminCategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
-        fields = ["id", "name", "slug", "parent", "description", "image", "is_active", "sort_order", *SEO, "created_at", "updated_at"]
+        fields = ["id", "name", "slug", "parent", "description", "image", "is_active", "show_in_navigation",
+                  "sort_order", *SEO, "product_count", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
         extra_kwargs = {"slug": {"required": False}}
+
+    product_count = serializers.SerializerMethodField()
+
+    def get_product_count(self, obj) -> int:
+        return obj.product_links.count()
 
     def validate_parent(self, parent):
         if parent and self.instance:
@@ -145,9 +151,12 @@ class AdminCategorySerializer(serializers.ModelSerializer):
 class AdminBrandSerializer(serializers.ModelSerializer):
     class Meta:
         model = Brand
-        fields = ["id", "name", "slug", "logo", "description", "country", "is_active", *SEO, "created_at", "updated_at"]
+        fields = ["id", "name", "slug", "logo", "description", "country", "is_active", "sort_order", *SEO,
+                  "product_count", "created_at", "updated_at"]
         read_only_fields = ["created_at", "updated_at"]
         extra_kwargs = {"slug": {"required": False}}
+
+    product_count = serializers.IntegerField(source="products.count", read_only=True)
 
 
 class AdminAttributeSerializer(serializers.ModelSerializer):
@@ -232,6 +241,34 @@ class AdminAttributeValueSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class AdminProductListSerializer(serializers.ModelSerializer):
+    brand_name = serializers.CharField(source="brand.name", read_only=True, default=None)
+    primary_image = serializers.SerializerMethodField()
+    min_price = serializers.IntegerField(read_only=True)
+    variant_count = serializers.IntegerField(read_only=True)
+    available_count = serializers.IntegerField(read_only=True)
+    reserved_count = serializers.IntegerField(read_only=True)
+    category_names = serializers.SerializerMethodField()
+    imported = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Product
+        fields = ["id", "name", "slug", "status", "brand", "brand_name", "primary_image", "min_price", "variant_count",
+                  "available_count", "reserved_count", "category_names", "is_featured", "imported", "published_at",
+                  "created_at", "updated_at"]
+
+    def get_primary_image(self, obj) -> str | None:
+        images = list(obj.images.all())
+        if not images:
+            return None
+        request = self.context.get("request")
+        url = images[0].image.url
+        return request.build_absolute_uri(url) if request else url
+
+    def get_category_names(self, obj) -> list:
+        return [pc.category.name for pc in obj.product_categories.all()]
+
+
 class AdminProductSerializer(serializers.ModelSerializer):
     category_links = AdminProductCategorySerializer(source="product_categories", many=True, required=False)
     attribute_values = AdminAttributeValueSerializer(many=True, required=False)
@@ -242,9 +279,18 @@ class AdminProductSerializer(serializers.ModelSerializer):
         model = Product
         fields = ["id", "name", "slug", "brand", "short_description", "description", "status", "published_at",
                   "is_featured", "sort_order", *SEO, "category_links", "attribute_values", "variants", "images",
-                  "created_at", "updated_at"]
-        read_only_fields = ["status", "published_at", "created_at", "updated_at"]
+                  "import_sources", "created_at", "updated_at"]
+        read_only_fields = ["status", "created_at", "updated_at"]
         extra_kwargs = {"slug": {"required": False}}
+
+    import_sources = serializers.SerializerMethodField()
+
+    def get_import_sources(self, obj) -> list:
+        return [{"id": sp.pk, "source_site": sp.source_site, "source_product_id": sp.source_product_id,
+                 "product_url": sp.product_url, "regular_price": sp.regular_price, "sale_price": sp.sale_price,
+                 "availability": sp.availability, "last_successful_sync_at": sp.last_successful_sync_at,
+                 "reviewed_at": sp.reviewed_at, "reviewed_by": sp.reviewed_by.phone if sp.reviewed_by else None}
+                for sp in obj.source_products.select_related("reviewed_by")]
 
     def validate_category_links(self, links):
         if sum(1 for link in links if link.get("is_primary")) > 1:

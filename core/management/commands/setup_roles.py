@@ -18,6 +18,7 @@ ROLES = {
         *perms("products", ["sourceproduct", "importjob", "importitem", "importerrorlog"], ["view"]),
         *perms("categories", ["category"], ["view", "change"]),
         "products.add_importjob", "products.run_import", "products.review_sourceproduct",
+        "core.view_auditlog",
     ],
     "order_manager": [
         *perms("commerce", ["order"], ["view", "change"]), "commerce.manage_order_status",
@@ -34,11 +35,13 @@ ROLES = {
         *perms("inventory", ["reservation"], ["view"]),
     ],
     "content_editor": [
-        *perms("cms", ["page", "blogcategory", "blogpost", "faq", "banner", "slider", "slide", "seometadata"]),
-        "cms.view_storesettings", "cms.change_storesettings",
+        *perms("cms", ["page", "blogcategory", "blogpost", "faq", "banner", "slider", "slide", "seometadata",
+                       "navigationmenu", "navigationitem", "homepagesection"]),
+        "cms.publish_navigationmenu", "cms.view_storesettings", "cms.change_storesettings",
+        *perms("catalog", ["category", "brand", "product"], ["view"]),
     ],
     "support": [
-        *perms("accounts", ["user"], ["view"]),
+        *perms("accounts", ["user", "address"], ["view"]),
         *perms("commerce", ["order"], ["view"]),
         *perms("notifications", ["smslog"], ["view"]), "notifications.retry_sms",
     ],

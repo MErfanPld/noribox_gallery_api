@@ -1,5 +1,8 @@
 from django.contrib.auth.models import Group
 from django.db import IntegrityError, transaction
+from django.db.models import Count, Max, Q, Sum
+from django.db.models.functions import Coalesce
+from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, mixins, permissions, status, viewsets
@@ -12,12 +15,13 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from accounts import serializers as s
 from accounts.models import Address, OTPCode, User
 from accounts.services import (
-    get_or_create_otp_user, mark_phone_verified, request_otp, set_password_and_revoke_tokens, verify_otp,
+    get_or_create_otp_user, mark_phone_verified, request_otp, revoke_all_tokens, set_password_and_revoke_tokens,
+    verify_otp,
 )
-from core import ratelimit
+from core import audit, ratelimit
 from core.exceptions import ConflictError, ServiceError
 from core.net import get_client_ip
-from core.permissions import AdminModelPermission
+from core.permissions import AdminModelPermission, IsStaff
 
 
 def _token_response(user, http_status=status.HTTP_200_OK):
@@ -219,3 +223,56 @@ class AdminRoleViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = s.GroupSerializer
     permission_classes = [AdminModelPermission]
     pagination_class = None
+
+
+PAID_STATUSES = ["paid", "processing", "shipped", "delivered"]
+
+
+class AdminCustomerViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    """Customers (non-staff accounts) with order statistics computed from real orders."""
+
+    permission_classes = [AdminModelPermission]
+    queryset = User.objects.filter(is_staff=False)
+    filterset_fields = ["is_active"]
+    search_fields = ["phone", "first_name", "last_name", "email"]
+    ordering_fields = ["date_joined", "last_login", "order_count", "paid_total", "last_order_at"]
+    action_perms = {"set_active": ["accounts.change_user"]}
+
+    def get_queryset(self):
+        paid = Q(orders__status__in=PAID_STATUSES)
+        qs = User.objects.filter(is_staff=False).annotate(
+            order_count=Count("orders", distinct=True),
+            paid_order_count=Count("orders", filter=paid, distinct=True),
+            paid_total=Coalesce(Sum("orders__total", filter=paid), 0),
+            last_order_at=Max("orders__created_at"),
+        ).order_by("-date_joined")
+        if self.action == "retrieve":
+            qs = qs.prefetch_related("addresses")
+        return qs
+
+    def get_serializer_class(self):
+        return s.AdminCustomerDetailSerializer if self.action == "retrieve" else s.AdminCustomerSerializer
+
+    @extend_schema(request=s.SetActiveSerializer, responses=s.AdminCustomerSerializer)
+    @action(detail=True, methods=["post"], url_path="set-active")
+    def set_active(self, request, pk=None):
+        """Disable/enable an account. Disabling also revokes every issued token."""
+        customer = self.get_object()
+        ser = s.SetActiveSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        User.objects.filter(pk=customer.pk).update(is_active=ser.validated_data["is_active"])
+        if not ser.validated_data["is_active"]:
+            revoke_all_tokens(customer)
+        audit.record(request.user, "customer.activate" if ser.validated_data["is_active"] else "customer.deactivate",
+                     customer, {"reason": ser.validated_data["reason"]})
+        return Response(s.AdminCustomerSerializer(self.get_queryset().get(pk=customer.pk)).data)
+
+
+class AdminMeView(APIView):
+    """The signed-in staff member and their effective permissions (drives the admin UI)."""
+
+    permission_classes = [IsStaff]
+
+    @extend_schema(tags=["admin"], responses=s.AdminMeSerializer)
+    def get(self, request):
+        return Response(s.AdminMeSerializer(request.user).data)

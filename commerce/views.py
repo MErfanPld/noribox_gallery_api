@@ -1,9 +1,11 @@
 from django.conf import settings
-from django.db.models import Prefetch
+import django_filters
+from django.db.models import Count, Prefetch
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import extend_schema
 from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -12,7 +14,7 @@ from catalog.models import ProductImage
 from commerce import serializers as s
 from commerce import services
 from commerce.models import Cart, CartItem, Order
-from core import ratelimit
+from core import audit, ratelimit
 from core.exceptions import ServiceError
 from core.permissions import AdminModelPermission
 from core.throttling import ScopedRateThrottle
@@ -158,17 +160,56 @@ def _phone_matches(order, phone):
     return matched
 
 
+class AdminOrderFilter(django_filters.FilterSet):
+    created_after = django_filters.DateTimeFilter(field_name="created_at", lookup_expr="gte")
+    created_before = django_filters.DateTimeFilter(field_name="created_at", lookup_expr="lte")
+    status__in = django_filters.BaseInFilter(field_name="status")
+    payment_status = django_filters.CharFilter(field_name="payments__status")
+
+    class Meta:
+        model = Order
+        fields = ["status", "needs_review", "user", "refund_status"]
+
+
 class AdminOrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin, viewsets.GenericViewSet):
     serializer_class = s.AdminOrderSerializer
     permission_classes = [AdminModelPermission]
-    filterset_fields = ["status", "needs_review", "user"]
-    search_fields = ["number", "user__phone", "recipient_name", "recipient_phone"]
+    filterset_class = AdminOrderFilter
+    search_fields = ["number", "user__phone", "user__first_name", "user__last_name", "recipient_name", "recipient_phone"]
     ordering_fields = ["created_at", "total", "paid_at"]
     action_perms = {"transition": ["commerce.manage_order_status"], "clear_review": ["commerce.manage_order_status"],
-                    "record_refund": ["commerce.record_refund"]}
+                    "record_refund": ["commerce.record_refund"], "notes": ["commerce.view_order"]}
     queryset = Order.objects.select_related("user", "shipment").prefetch_related(
-        "items", "status_history__changed_by", "payments__receipts__reviews"
+        "items", "status_history__changed_by", "payments__receipts__reviews", "notes__author"
     )
+
+    def get_queryset(self):
+        if self.action == "list":
+            return Order.objects.select_related("user").prefetch_related("payments").annotate(
+                item_count=Count("items", distinct=True)).distinct()
+        return self.queryset
+
+    def get_serializer_class(self):
+        return s.AdminOrderListSerializer if self.action == "list" else s.AdminOrderSerializer
+
+    def perform_update(self, serializer):
+        serializer.save()
+        audit.record(self.request.user, "order.update_note", serializer.instance)
+
+    @extend_schema(request=s.OrderNoteSerializer, responses=s.OrderNoteSerializer(many=True))
+    @action(detail=True, methods=["get", "post"])
+    def notes(self, request, pk=None):
+        """Internal notes (staff only). Adding one needs change_order."""
+        order = self.get_object()
+        if request.method == "POST":
+            if not (request.user.is_superuser or request.user.has_perm("commerce.change_order")):
+                raise PermissionDenied()
+            ser = s.OrderNoteSerializer(data=request.data)
+            ser.is_valid(raise_exception=True)
+            ser.save(order=order, author=request.user)
+            audit.record(request.user, "order.note", order)
+            return Response(ser.data, status=status.HTTP_201_CREATED)
+        return Response(s.OrderNoteSerializer(order.notes.select_related("author"), many=True).data)
 
     @extend_schema(request=s.AdminTransitionSerializer, responses=s.AdminOrderSerializer)
     @action(detail=True, methods=["post"])
@@ -194,4 +235,5 @@ class AdminOrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins
         order = self.get_object()
         order.needs_review, order.review_reason = False, ""
         order.save(update_fields=["needs_review", "review_reason", "updated_at"])
+        audit.record(request.user, "order.clear_review", order)
         return Response(self.get_serializer(order).data)
