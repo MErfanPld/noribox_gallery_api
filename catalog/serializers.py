@@ -5,6 +5,7 @@ from catalog.models import (
     Attribute, AttributeOption, Brand, Category, CategoryAttribute, Product, ProductAttributeValue,
     ProductCategory, ProductImage, ProductVariant,
 )
+from core.files import ClearableFilesMixin
 
 SEO = ["meta_title", "meta_description", "meta_keywords", "canonical_url"]
 
@@ -125,7 +126,7 @@ class ProductDetailSerializer(ProductListSerializer):
 
 
 # --- admin -------------------------------------------------------------------
-class AdminCategorySerializer(serializers.ModelSerializer):
+class AdminCategorySerializer(ClearableFilesMixin, serializers.ModelSerializer):
     class Meta:
         model = Category
         fields = ["id", "name", "slug", "parent", "description", "image", "is_active", "show_in_navigation",
@@ -148,7 +149,7 @@ class AdminCategorySerializer(serializers.ModelSerializer):
         return parent
 
 
-class AdminBrandSerializer(serializers.ModelSerializer):
+class AdminBrandSerializer(ClearableFilesMixin, serializers.ModelSerializer):
     class Meta:
         model = Brand
         fields = ["id", "name", "slug", "logo", "description", "country", "is_active", "sort_order", *SEO,

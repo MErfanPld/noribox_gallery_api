@@ -94,3 +94,16 @@ class PrivateStorage(FileSystemStorage):
 
 
 private_storage = PrivateStorage()
+
+
+class ClearableFilesMixin:
+    """Admin serializers: an optional file/image accepts JSON ``null`` to remove it."""
+
+    def get_fields(self):
+        from rest_framework import serializers
+
+        fields = super().get_fields()
+        for field in fields.values():
+            if isinstance(field, serializers.FileField) and not field.required and not field.read_only:
+                field.allow_null = True
+        return fields

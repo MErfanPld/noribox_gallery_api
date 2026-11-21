@@ -224,3 +224,16 @@ class CmsPermissionTests(TestCase):
         api = client_for(editor)
         self.assertEqual(api.post(NAV, {"menu": header.pk, "label": "x", "url": "/x"}, format="json").status_code, 201)
         self.assertEqual(api.post(f"{MENUS}{header.pk}/publish/").status_code, 403)  # needs publish permission
+
+
+class ImageClearTests(TestCase):
+    def test_optional_image_can_be_removed_with_null(self):
+        from core.testutils import png_file
+
+        api = client_for(superuser())
+        res = api.post("/api/admin/cms/pages/", {"title": "x", "featured_image": png_file("a.png")}, format="multipart")
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertTrue(res.json()["featured_image"])
+        res = api.patch(f"/api/admin/cms/pages/{res.json()['id']}/", {"featured_image": None}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertIsNone(res.json()["featured_image"])

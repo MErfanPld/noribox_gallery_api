@@ -186,7 +186,7 @@ class AdminOrderViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins
     def get_queryset(self):
         if self.action == "list":
             return Order.objects.select_related("user").prefetch_related("payments").annotate(
-                item_count=Count("items", distinct=True)).distinct()
+                item_count=Count("items", distinct=True)).distinct().order_by("-created_at", "-id")
         return self.queryset
 
     def get_serializer_class(self):

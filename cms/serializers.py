@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from core.files import ClearableFilesMixin
+
 from cms.models import (
     FAQ, Banner, BlogCategory, BlogPost, HomepageSection, NavigationItem, NavigationMenu, Page, SEOMetadata, Slide,
     Slider, StoreSettings,
@@ -88,7 +90,7 @@ class PublicStoreSettingsSerializer(serializers.ModelSerializer):
 def admin_serializer(model_cls, read_only=("created_at", "updated_at")):
     meta = type("Meta", (), {"model": model_cls, "fields": "__all__",
                              "read_only_fields": list(read_only)})
-    return type(f"Admin{model_cls.__name__}Serializer", (serializers.ModelSerializer,), {"Meta": meta})
+    return type(f"Admin{model_cls.__name__}Serializer", (ClearableFilesMixin, serializers.ModelSerializer), {"Meta": meta})
 
 
 SOCIAL_PLATFORMS = ("instagram", "telegram", "whatsapp", "youtube", "aparat", "x", "linkedin", "eitaa", "bale", "rubika")
@@ -239,7 +241,7 @@ class ReorderSerializer(serializers.Serializer):
 
 
 # --- homepage ------------------------------------------------------------------
-class AdminHomepageSectionSerializer(serializers.ModelSerializer):
+class AdminHomepageSectionSerializer(ClearableFilesMixin, serializers.ModelSerializer):
     class Meta:
         model = HomepageSection
         fields = "__all__"
