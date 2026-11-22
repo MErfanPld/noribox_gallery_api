@@ -12,7 +12,7 @@ import ipaddress
 import socket
 import ssl
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 from django.conf import settings
 
@@ -83,10 +83,30 @@ def validate_url(url):
     addresses = [str(literal)] if literal else _resolve(host, port)
     if not addresses or not all(is_public_ip(a) for a in addresses):
         raise UnsafeURLError("URL resolves to a non-public address.")
-    path = parts.path or "/"
+    return scheme, host, port, _ascii_target(parts), addresses[0]
+
+
+# Characters left as-is when percent-encoding a request target (RFC 3986 reserved + unreserved + "%").
+_SAFE_PATH = "/%:@!$&'()*+,;=-._~"
+_SAFE_QUERY = _SAFE_PATH + "?"
+
+
+def _ascii_target(parts):
+    """Request target for http.client, which only sends ASCII: non-ASCII characters (e.g. Persian
+    image file names) are UTF-8 percent-encoded; existing %XX escapes are kept as they are."""
+    path = quote(parts.path or "/", safe=_SAFE_PATH)
     if parts.query:
-        path += "?" + parts.query
-    return scheme, host, port, path, addresses[0]
+        path += "?" + quote(parts.query, safe=_SAFE_QUERY)
+    return path
+
+
+def _ascii_host(host):
+    """Internationalised domain names → punycode for the Host header and TLS SNI."""
+    try:
+        host.encode("ascii")
+        return host
+    except UnicodeEncodeError:
+        return host.encode("idna").decode("ascii")
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
@@ -109,6 +129,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 def _request(scheme, host, port, path, ip, headers, timeout):
+    host = _ascii_host(host)
     cls = _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
     conn = cls(host, ip, port, timeout)
     conn.request("GET", path, headers={"Host": host if port in (80, 443) else f"{host}:{port}", **headers})
@@ -123,7 +144,7 @@ def safe_fetch(url, *, max_bytes, timeout=None, headers=None, max_redirects=5):
         scheme, host, port, path, ip = validate_url(current)
         try:
             conn, resp = _request(scheme, host, port, path, ip, headers, timeout)
-        except (OSError, http.client.HTTPException) as exc:
+        except (OSError, http.client.HTTPException, UnicodeError) as exc:
             raise FetchError(f"Request to {host} failed: {exc.__class__.__name__}") from exc
         try:
             if resp.status in (301, 302, 303, 307, 308):

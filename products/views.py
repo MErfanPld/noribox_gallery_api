@@ -1,3 +1,5 @@
+import logging
+
 from django.conf import settings
 from django.db.models import Count
 from django.utils import timezone
@@ -17,6 +19,9 @@ from products.models import ImportErrorLog, ImportItem, ImportJob, SourceProduct
 from products.services.review import (
     approve_source, create_draft_product, ignore_source, link_to_variant, restore_source,
 )
+
+
+logger = logging.getLogger("noribox")
 
 
 class AdminImportJobViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.CreateModelMixin, viewsets.GenericViewSet):
@@ -180,6 +185,9 @@ class AdminSourceProductViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin
                     results.append({"id": pk, "ok": True})
             except APIException as exc:
                 results.append({"id": pk, "ok": False, "code": getattr(exc, "code", "error"), "message": str(exc.detail)})
+            except Exception:  # noqa: BLE001 — one bad item must not fail the whole batch
+                logger.exception("Bulk review %s failed for source product %s", op, pk)
+                results.append({"id": pk, "ok": False, "code": "server_error", "message": "Unexpected error; see server log."})
         return Response({"results": results, "succeeded": sum(r["ok"] for r in results),
                          "failed": sum(not r["ok"] for r in results)})
 

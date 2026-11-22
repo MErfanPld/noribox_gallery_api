@@ -114,3 +114,33 @@ class MigrationTests(TransactionTestCase):
 
         sp = SourceProduct.objects.get(source_product_id="42")
         self.assertEqual((sp.name, sp.review_status), ("Legacy", "pending"))
+
+
+class NonAsciiUrlTests(TestCase):
+    def test_persian_paths_are_percent_encoded_for_http_client(self):
+        from unittest import mock
+        from urllib.parse import urlsplit
+
+        from core import http as h
+
+        target = h._ascii_target(urlsplit("https://mehrdadgallery.com/wp-content/uploads/2024/05/عطر-تست.jpg?v=۱&a=b"))
+        target.encode("ascii")  # http.client requirement
+        self.assertTrue(target.startswith("/wp-content/uploads/2024/05/%D8%B9%D8%B7%D8%B1-"))
+        self.assertIn("?v=%DB%B1&a=b", target)
+        # already-encoded URLs are not double-encoded
+        self.assertEqual(h._ascii_target(urlsplit("https://x.test/a%20b.jpg")), "/a%20b.jpg")
+        self.assertEqual(h._ascii_host("مثال.ایران"), "مثال.ایران".encode("idna").decode())
+
+        with mock.patch.object(h, "_resolve", return_value=["93.184.216.34"]):
+            _scheme, _host, _port, path, _ip = h.validate_url("https://example.com/تصویر.png")
+        path.encode("ascii")
+
+    def test_image_download_failure_never_raises(self):
+        from unittest import mock
+
+        from products.services import review
+
+        with mock.patch.object(review, "safe_fetch", side_effect=UnicodeEncodeError("ascii", "x", 0, 1, "bad")):
+            self.assertIsNone(review.download_image("https://example.com/عکس.jpg"))
+        with mock.patch.object(review, "safe_fetch", side_effect=RuntimeError("boom")):
+            self.assertIsNone(review.download_image("https://example.com/a.jpg"))

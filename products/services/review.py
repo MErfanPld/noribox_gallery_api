@@ -37,8 +37,11 @@ def download_image(url, max_size=None):
     max_size = max_size or settings.PRODUCT_IMAGE_MAX_SIZE_BYTES
     try:
         data = safe_fetch(url, max_bytes=max_size, headers={"Accept": "image/*"}).body
-    except (UnsafeURLError, FetchError, OSError) as exc:
+    except (UnsafeURLError, FetchError, OSError, UnicodeError) as exc:
         logger.warning("Image download refused/failed %s: %s", url, exc)
+        return None
+    except Exception:  # noqa: BLE001 — a missing image must never block approving the product
+        logger.exception("Unexpected error downloading image %s", url)
         return None
     kind = detect_kind(data[:16])
     if kind not in {"jpg", "jpeg", "png", "webp", "gif"}:
