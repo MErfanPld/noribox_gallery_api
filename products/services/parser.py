@@ -45,6 +45,8 @@ class ParsedProduct:
     stock_quantity: int | None = None
     image_url: str | None = None
     raw_data: dict[str, Any] = field(default_factory=dict)
+    # WooCommerce card classes "product_cat-<slug>" (empty when the theme omits them).
+    category_slugs: list[str] = field(default_factory=list)
 
 
 def normalize_digits(text: str) -> str:
@@ -253,9 +255,17 @@ def parse_listing_html(
                 or img.get("data-srcset"),
             )
 
+        category_slugs = []
+        for cls in card.get("class") or []:
+            if cls.startswith("product_cat-") and len(cls) > len("product_cat-"):
+                slug = unquote(cls[len("product_cat-"):])[:255]
+                if slug not in category_slugs:
+                    category_slugs.append(slug)
+
         products.append(
             ParsedProduct(
                 source_product_id=pid,
+                category_slugs=category_slugs,
                 name=name[:512],
                 product_url=product_url,
                 regular_price=regular,

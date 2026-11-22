@@ -179,3 +179,21 @@ class ImportJobStatusTests(TestCase):
         ImportJob.objects.filter(pk=running.pk).update(status="pending")
         job = run_job(ImportJob.objects.get(pk=running.pk))
         self.assertEqual(job.status, "cancelled")
+
+
+class CardCategoryTests(TestCase):
+    def test_product_cat_classes_become_source_categories(self):
+        from products.services.importer import run_import_from_html
+
+        html = """<ul><li class="product type-product post-77 product_cat-men-perfume product_cat-%d8%b9%d8%b7%d8%b1">
+          <a href="https://mehrdadgallery.com/product/x/"><h2 class="woocommerce-loop-product__title">عطر تست</h2></a>
+          <span>۱۲۰,۰۰۰ تومان</span></li></ul>"""
+        run_import_from_html(html, "mehrdadgallery", job=ImportJob.objects.create(source_site="mehrdadgallery"))
+        sp = SourceProduct.objects.get(source_product_id="77")
+        self.assertEqual(sorted(c.slug for c in sp.categories.all()), sorted(["men-perfume", "عطر"]))
+        cat = Category.objects.create(name="عطر مردانه", slug="men")
+        SourceCategory.objects.filter(slug="men-perfume").update(mapped_category=cat)
+        staff = make_staff(*REVIEWER)
+        res = client_for(staff).post(f"/api/admin/imports/source-products/{sp.pk}/approve/", {"download_images": False}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(Product.objects.get(pk=res.json()["product_id"]).primary_category, cat)

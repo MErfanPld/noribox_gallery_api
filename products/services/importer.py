@@ -38,6 +38,15 @@ class ImportCancelled(Exception):
     """Raised at a checkpoint when an administrator cancelled the running job."""
 
 
+def _source_category(source_site: str, slug: str):
+    from categories.models import Category as SourceCategory
+
+    cat, _ = SourceCategory.objects.get_or_create(
+        source_site=source_site, slug=slug, defaults={"name": slug.replace("-", " ")},
+    )
+    return cat
+
+
 def source_category_for_url(url: str | None, source_site: str):
     """A WooCommerce category listing (``/product-category/<slug>/``) → staged source category.
 
@@ -220,8 +229,11 @@ def import_products(
                 continue
             with transaction.atomic():
                 obj, action, changes = stage_product(parsed, source_site, dry_run=dry_run)
-                if source_category is not None and obj is not None and obj.pk and not dry_run:
-                    obj.categories.add(source_category)
+                if obj is not None and obj.pk and not dry_run:
+                    if source_category is not None:
+                        obj.categories.add(source_category)
+                    for slug in parsed.category_slugs:
+                        obj.categories.add(_source_category(source_site, slug))
             key = {
                 ImportItem.Action.CREATED: "created", ImportItem.Action.WOULD_CREATE: "created",
                 ImportItem.Action.UPDATED: "updated", ImportItem.Action.WOULD_UPDATE: "updated",
